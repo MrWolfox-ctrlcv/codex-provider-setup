@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codex-provider-setup"
+version = "0.1.0"
+description = "Cross-platform one-shot setup/manager for arbitrary Codex model providers"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/MrWolfox-ctrlcv/codex-provider-setup"
+Repository = "https://github.com/MrWolfox-ctrlcv/codex-provider-setup"
+
+[project.scripts]
+codex-provider-setup = "codex_provider.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["codex_provider"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
