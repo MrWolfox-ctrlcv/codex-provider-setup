@@ -295,7 +295,28 @@ def _pause_before_exit() -> None:
         pass
 
 
+def _configure_stdio() -> None:
+    """Make stdout/stderr tolerate non-UTF-8 consoles.
+
+    The whole UI is Chinese, but a Windows console may default to GBK/cp936 and
+    CI runners to cp1252.  Without this, printing a normal message raises
+    UnicodeEncodeError and the program dies while reporting an error.  Prefer
+    real UTF-8 (so Chinese renders correctly), and keep a lossy error handler as
+    a backstop for consoles that still cannot represent a character.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # Stream without reconfigure(): just guarantee it never raises.
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _configure_stdio()
     try:
         return _main(argv)
     except interact.AbortError as exc:

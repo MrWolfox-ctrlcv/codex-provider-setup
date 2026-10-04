@@ -18,25 +18,50 @@ def _paint(code: str, text: str) -> str:
     return text
 
 
+def _safe_print(text: str) -> None:
+    """Print without ever raising on a console that cannot encode the text.
+
+    A Chinese Windows console defaults to GBK/cp936 (and some CI runners to
+    cp1252), where the UI's own Chinese strings raise UnicodeEncodeError.  That
+    used to crash the program *while it was reporting an error*, so the user saw
+    a traceback instead of the message.  Fall back to a lossy replacement.
+    """
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        stream = sys.stdout
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        data = (text + "\n").encode(encoding, errors="replace")
+        try:
+            buffer = getattr(stream, "buffer", None)
+            if buffer is not None:
+                buffer.write(data)
+                buffer.flush()
+            else:
+                stream.write(data.decode(encoding, errors="replace"))
+        except Exception:
+            pass
+
+
 def ok(m: str) -> None:
-    print(_paint("32", "[OK] ") + m)
+    _safe_print(_paint("32", "[OK] ") + m)
 
 
 def warn(m: str) -> None:
-    print(_paint("33", "[!]  ") + m)
+    _safe_print(_paint("33", "[!]  ") + m)
 
 
 def head(m: str) -> None:
-    print("")
-    print(_paint("37", m))
+    _safe_print("")
+    _safe_print(_paint("37", m))
 
 
 def dim(m: str) -> None:
-    print(_paint("90", m))
+    _safe_print(_paint("90", m))
 
 
 def err(m: str) -> None:
-    print(_paint("31", "[X] ") + m)
+    _safe_print(_paint("31", "[X] ") + m)
 
 
 def _pause() -> None:

@@ -480,3 +480,45 @@ def test_pyproject_does_not_hardcode_a_second_version():
     assert "version" not in project, "pyproject hardcodes a version again"
     assert "version" in project.get("dynamic", [])
     assert data["tool"]["hatch"]["version"]["path"] == "codex_provider/__init__.py"
+
+
+def test_selftest_survives_a_non_utf8_console():
+    """The UI is Chinese; a cp1252/GBK console must not crash it.
+
+    CI runners default to cp1252 and Chinese Windows consoles to GBK, where
+    printing a normal message raised UnicodeEncodeError and killed the program
+    while it was reporting an error.
+    """
+    import io
+    import subprocess
+    import sys
+
+    env = dict(**__import__("os").environ)
+    env["PYTHONIOENCODING"] = "cp1252"
+    proc = subprocess.run(
+        [sys.executable, "-m", "codex_provider", "selftest"],
+        capture_output=True,
+        env=env,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", errors="replace")
+    assert b"UnicodeEncodeError" not in proc.stderr
+
+
+def test_print_helpers_never_raise_on_unencodable_console(monkeypatch):
+    """_safe_print must degrade instead of raising."""
+    import io
+    import sys as _sys
+
+    from codex_provider import interact
+
+    class BadStream(io.TextIOBase):
+        encoding = "cp1252"
+
+        def write(self, s):  # noqa: ANN001
+            raise UnicodeEncodeError("cp1252", s, 0, 1, "nope")
+
+    monkeypatch.setattr(_sys, "stdout", BadStream())
+    # Must not raise.
+    interact.ok("中文消息")
+    interact.err("中文错误")
