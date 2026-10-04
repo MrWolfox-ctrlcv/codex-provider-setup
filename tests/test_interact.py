@@ -88,13 +88,23 @@ def test_choose_provider_preset(monkeypatch):
     assert interact.choose_provider(allow_custom=True) is ds
 
 
+def test_choose_provider_wolfox_preset(monkeypatch):
+    ds = Provider(id="deepseek", name="DeepSeek 官方", base_url="https://api.deepseek.com/", models=["ds-1"])
+    wx = Provider(id="wolfox", name="Wolfox AI", base_url="https://api.wolfoxlabs.xyz/v1", models=["w1"])
+    monkeypatch.setattr(interact.presets, "deepseek_preset", lambda: ds)
+    monkeypatch.setattr(interact.presets, "wolfox_preset", lambda: wx)
+    monkeypatch.setattr(interact.service, "installed_providers", lambda: [])
+    monkeypatch.setattr(builtins, "input", lambda _p="": "2")
+    assert interact.choose_provider(allow_custom=True) is wx
+
+
 def test_choose_provider_installed(monkeypatch):
     ds = Provider(id="deepseek", name="DeepSeek 官方", base_url="https://api.deepseek.com/", models=["ds-1"])
     monkeypatch.setattr(interact.presets, "deepseek_preset", lambda: ds)
     monkeypatch.setattr(interact.service, "installed_providers", lambda: [make_rec(["x"])])
     built = Provider(id="mimo", name="Mimo 测试", base_url="https://api.mimo.test/v1", models=["x"])
     monkeypatch.setattr(interact.service, "provider_from_installed", lambda rec: built)
-    monkeypatch.setattr(builtins, "input", lambda _p="": "2")
+    monkeypatch.setattr(builtins, "input", lambda _p="": "3")
     assert interact.choose_provider(allow_custom=False) is built
 
 
@@ -104,7 +114,7 @@ def test_choose_provider_custom_branch(monkeypatch):
     monkeypatch.setattr(interact.service, "installed_providers", lambda: [])
     custom = Provider(id="myapi", name="My", base_url="https://my.example/v1", models=["a"])
     monkeypatch.setattr(interact, "custom_provider_wizard", lambda: custom)
-    monkeypatch.setattr(builtins, "input", lambda _p="": "2")
+    monkeypatch.setattr(builtins, "input", lambda _p="": "3")
     assert interact.choose_provider(allow_custom=True) is custom
 
 
@@ -520,6 +530,9 @@ def test_main_menu_install_flow(monkeypatch, tmp_codex_home):
     monkeypatch.setattr(interact.service, "sync_from_upstream", lambda *a, **k: ["merged-1", "merged-2"])
     installed: list[tuple[object, str]] = []
     monkeypatch.setattr(interact.service, "install_provider", lambda p, k: installed.append((p, k)))
+    # keep the flow deterministic regardless of whether Codex runs on this machine
+    monkeypatch.setattr(interact.doctor, "find_codex_processes", lambda: [])
+    monkeypatch.setattr(interact.doctor, "ui_state_files", lambda: [])
     answers = iter(["1", "y", "7"])
     monkeypatch.setattr(builtins, "input", lambda _p="": next(answers))
     interact.main_menu()
@@ -528,6 +541,27 @@ def test_main_menu_install_flow(monkeypatch, tmp_codex_home):
     assert key == "sk-x"
     assert prov.meta_overrides == {"ds-1": {"context_window": 111}}
     assert prov.models == ["merged-1", "merged-2"]
+
+
+def test_main_menu_install_warns_when_codex_running(monkeypatch, tmp_codex_home, capsys):
+    """Installing while the desktop app runs risks it overwriting config.toml,
+    so the user must confirm (and can abort)."""
+    monkeypatch.setattr(interact, "_active", None)
+    monkeypatch.setattr(interact.service, "current_state", lambda: ("(未设置)", "(未设置)"))
+    prov = Provider(id="wolfox", name="Wolfox AI", base_url="https://api.wolfoxlabs.xyz/v1", models=["w1"])
+    monkeypatch.setattr(interact, "choose_provider", lambda allow_custom: prov)
+    monkeypatch.setattr(interact.service, "get_api_key", lambda *a, **k: "sk-x")
+    monkeypatch.setattr(interact.doctor, "find_codex_processes", lambda: ["Codex.exe"])
+    called: list[str] = []
+    monkeypatch.setattr(interact.service, "install_provider", lambda p, k: called.append("install"))
+    # decline the "continue anyway?" prompt, then exit
+    answers = iter(["1", "n", "7"])
+    monkeypatch.setattr(builtins, "input", lambda _p="": next(answers))
+    interact.main_menu()
+    assert called == []
+    out = capsys.readouterr().out
+    assert "正在运行" in out
+    assert "未写入任何文件" in out
 
 
 def test_main_menu_no_codex_home(monkeypatch, tmp_path, capsys):

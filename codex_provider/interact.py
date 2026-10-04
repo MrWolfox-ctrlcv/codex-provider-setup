@@ -5,7 +5,7 @@ import re
 import sys
 from getpass import getpass
 
-from codex_provider import heuristics, paths, presets, registry, service, upstream
+from codex_provider import doctor, heuristics, paths, presets, registry, service, upstream
 from codex_provider.io_utils import read_json, read_text
 from codex_provider.provider import Provider
 
@@ -39,6 +39,31 @@ def err(m: str) -> None:
     print(_paint("31", "[X] ") + m)
 
 
+def _pause() -> None:
+    """Keep the console window open on Windows so users can read messages."""
+    if sys.platform == "win32":
+        try:
+            _read("  按回车键退出...")
+        except (AbortError, OSError):
+            pass
+
+
+def _read(prompt: str = "") -> str:
+    """Safe input() wrapper: on EOF (non-interactive/closed stdin) raise a
+    clear AbortError instead of letting the process crash with a traceback."""
+    try:
+        return input(prompt)
+    except EOFError:
+        raise AbortError("输入流已关闭（EOF）。请在一个正常终端窗口中运行本程序。") from None
+    except OSError:
+        # pytest / captured-stdin environments raise OSError instead of EOFError
+        raise AbortError("输入流已关闭（EOF）。请在一个正常终端窗口中运行本程序。") from None
+
+
+class AbortError(Exception):
+    """Raised when the program cannot read user input (EOF / closed stdin)."""
+
+
 def confirm(prompt: str, default: bool = False) -> bool:
     if re.search(r"\[[yY]/", prompt):
         shown = prompt
@@ -46,7 +71,7 @@ def confirm(prompt: str, default: bool = False) -> bool:
         shown = f"{prompt} [Y/n]"
     else:
         shown = f"{prompt} [y/N]"
-    v = input(f"  {shown} ").strip().lower()
+    v = _read(f"  {shown} ").strip().lower()
     if not v:
         return default
     if v.startswith("y"):
@@ -61,7 +86,7 @@ def read_required(label: str, default: str = "", from_param: str = "") -> str:
         dim(f"{label} : {from_param}（来自参数）")
         return from_param
     hint = f" [默认 {default}]" if default else ""
-    v = input(f"  {label}{hint}: ").strip()
+    v = _read(f"  {label}{hint}: ").strip()
     if not v:
         return default
     return v
@@ -98,10 +123,12 @@ def read_choice_list(text: str, count: int) -> list[int] | None:
 def choose_provider(allow_custom: bool) -> Provider | None:
     head("选择 provider")
     preset = presets.deepseek_preset()
+    wolfox = presets.wolfox_preset()
     installed = [p for p in service.installed_providers() if p.get("id") != "deepseek"]
     default_model = preset.models[0] if preset.models else "(无)"
     print(f"   1) {preset.name}  ({preset.base_url}, 默认模型 {default_model})")
-    base = 1
+    print(f"   2) {wolfox.name}  ({wolfox.base_url}, 默认模型 {wolfox.models[0] if wolfox.models else '(无)'})")
+    base = 2
     if installed:
         dim("   ── 已接入的 provider（可重新接入/切换/回退） ──")
         for j, rec in enumerate(installed):
@@ -112,7 +139,7 @@ def choose_provider(allow_custom: bool) -> Provider | None:
     if allow_custom:
         print(f"   {n_custom}) 完全自定义")
     max_n = base + len(installed) + (1 if allow_custom else 0)
-    raw = input(f"   请输入 [1-{max_n}] ")
+    raw = _read(f"   请输入 [1-{max_n}] ")
     try:
         idx = int(raw.strip())
     except ValueError:
@@ -121,7 +148,7 @@ def choose_provider(allow_custom: bool) -> Provider | None:
         warn("输入无效，已取消。")
         return None
     if idx <= base:
-        return preset
+        return preset if idx == 1 else wolfox
     if idx <= base + len(installed):
         rec = installed[idx - base - 1]
         try:
@@ -135,7 +162,10 @@ def choose_provider(allow_custom: bool) -> Provider | None:
 def prompt_api_key(provider: Provider) -> str | None:
     print("")
     dim(f"Key 获取地址请查看你的 provider 控制台（一般以 {provider.key_prefix} 开头）")
-    v = getpass("  请输入 API Key: ").strip()
+    try:
+        v = getpass("  请输入 API Key: ").strip()
+    except (EOFError, OSError):
+        raise AbortError("输入流已关闭（EOF）。请在一个正常终端窗口中运行本程序。") from None
     if not v:
         warn("未输入 Key，已取消。")
         return None
@@ -153,7 +183,7 @@ def select_fetched_models(model_ids: list[str]) -> list[str] | None:
         print("  1) 全部接入")
         print("  2) 按关键字过滤后选择")
         print("  3) 手动输入模型名")
-        opt = input("  请选择 [1-3] ").strip()
+        opt = _read("  请选择 [1-3] ").strip()
         if opt == "1":
             return list(model_ids)
         if opt == "3":
@@ -167,7 +197,7 @@ def select_fetched_models(model_ids: list[str]) -> list[str] | None:
         warn("输入无效。")
     bad = 0
     while True:
-        kw = input("  关键字（直接回车=不过滤，列出全部） ").strip()
+        kw = _read("  关键字（直接回车=不过滤，列出全部） ").strip()
         filtered = [m for m in model_ids if not kw or kw.lower() in m.lower()]
         if not filtered:
             bad += 1
@@ -181,7 +211,7 @@ def select_fetched_models(model_ids: list[str]) -> list[str] | None:
             print(f"    {i:3}) {mid}")
         sel_bad = 0
         while True:
-            sel = read_choice_list(input("  选择编号（逗号分隔；a=全部匹配；q=重新过滤） "), len(filtered))
+            sel = read_choice_list(_read("  选择编号（逗号分隔；a=全部匹配；q=重新过滤） "), len(filtered))
             if sel is None:
                 break
             if sel:
@@ -339,7 +369,7 @@ def manage_models(record: dict) -> None:
         print("    6) 清空所有待处理变更")
         print("    7) 应用变更并写盘")
         print("    8) 返回（不写盘）")
-        opt = input("  请输入 [1-8] ").strip()
+        opt = _read("  请输入 [1-8] ").strip()
 
         if opt == "8":
             dim("已取消，未写盘。")
@@ -358,7 +388,7 @@ def manage_models(record: dict) -> None:
             print(f"  上游新候选 {len(cand)} 个：")
             for i, s in enumerate(cand, 1):
                 print(f"     {i:2}) {s}")
-            sel = read_choice_list(input("  输入编号（逗号/空格/区间；a=全部；q=返回） "), len(cand))
+            sel = read_choice_list(_read("  输入编号（逗号/空格/区间；a=全部；q=返回） "), len(cand))
             if sel is None or not sel:
                 continue
             for i in sel:
@@ -368,7 +398,7 @@ def manage_models(record: dict) -> None:
             continue
 
         if opt == "2":
-            raw = input("  输入要接入的模型名（逗号分隔，如 gpt-5.6-sol,qwen3-max） ")
+            raw = _read("  输入要接入的模型名（逗号分隔，如 gpt-5.6-sol,qwen3-max） ")
             bad2 = 0
             for piece in re.split(r"[,，;、]", raw):
                 nm = piece.strip()
@@ -409,7 +439,7 @@ def manage_models(record: dict) -> None:
             for i, s in enumerate(available, 1):
                 tag = "（上游未列出，疑已下架）" if s not in up_models else ""
                 print(f"     {i:2}) {s}{tag}")
-            sel = read_choice_list(input("  输入要移除的编号（逗号/空格/区间；q=返回） "), len(available))
+            sel = read_choice_list(_read("  输入要移除的编号（逗号/空格/区间；q=返回） "), len(available))
             if sel is None or not sel:
                 continue
             for i in sel:
@@ -436,7 +466,7 @@ def manage_models(record: dict) -> None:
                 ep_cur = row.get("effective_context_window_percent") if row and row.get("effective_context_window_percent") else 95
                 ac_cur = row.get("auto_compact_token_limit") if row and row.get("auto_compact_token_limit") is not None else "默认"
                 print(f"     {i:2}) {s}  (窗口 {cw_cur} / 有效 {ep_cur}% / 压缩阈值 {ac_cur})")
-            sel = read_choice_list(input("  编号（q=返回） "), len(avail))
+            sel = read_choice_list(_read("  编号（q=返回） "), len(avail))
             if sel is None or not sel:
                 continue
             slug = avail[sel[0]]
@@ -444,9 +474,9 @@ def manage_models(record: dict) -> None:
             def_cw = row.get("context_window") if row and row.get("context_window") else 1048576
             def_ep = row.get("effective_context_window_percent") if row and row.get("effective_context_window_percent") else 95
             def_ac = row.get("auto_compact_token_limit") if row and row.get("auto_compact_token_limit") is not None else ""
-            cw_in = input(f"  上下文窗口 [默认 {def_cw}] ").strip()
-            ep_in = input(f"  有效上下文百分比 [默认 {def_ep}] ").strip()
-            ac_in = input(f"  自动压缩 token 阈值（回车=默认，按百分比触发）[当前 {def_ac}] ").strip()
+            cw_in = _read(f"  上下文窗口 [默认 {def_cw}] ").strip()
+            ep_in = _read(f"  有效上下文百分比 [默认 {def_ep}] ").strip()
+            ac_in = _read(f"  自动压缩 token 阈值（回车=默认，按百分比触发）[当前 {def_ac}] ").strip()
             try:
                 cw_v = int(def_cw) if not cw_in else int(cw_in)
             except ValueError:
@@ -532,7 +562,7 @@ def manage_models(record: dict) -> None:
                 print("  在剩余模型中选择新的默认模型：")
                 for i, s in enumerate(fin, 1):
                     print(f"     {i:2}) {s}")
-                sel = read_choice_list(input("  编号（q=取消本次应用） "), len(fin))
+                sel = read_choice_list(_read("  编号（q=取消本次应用） "), len(fin))
                 if sel is None or not sel:
                     continue
                 new_default = fin[sel[0]]
@@ -596,6 +626,97 @@ def show_status(provider: Provider | None = None) -> None:
     print("")
 
 
+def _post_install_hint(provider: Provider) -> None:
+    """Right after a successful install, surface the two things that make Codex
+    keep showing the old provider/model on desktop."""
+    print("")
+    procs = doctor.find_codex_processes()
+    ui_files = doctor.ui_state_files()
+    if procs:
+        warn("检测到 Codex / ChatGPT 正在运行：" + " / ".join(procs))
+        warn("请在下次打开前完全退出（含托盘图标），否则应用退出时可能把 config.toml 覆盖回去。")
+        if ui_files:
+            dim("缓存清理需要应用处于关闭状态，已跳过；退出 Codex 后可运行菜单 6) 诊断与修复。")
+        print("")
+        dim("请完全退出 Codex（含托盘）后重新打开，并新建一个对话验证模型列表。")
+        return
+    if not ui_files:
+        dim("提示：请完全退出并重新打开 Codex，然后新建一个对话查看模型列表。")
+        return
+    dim("桌面端把模型列表/provider 显示缓存在本地；不清缓存时可能仍显示旧模型。")
+    if confirm("现在就清理桌面端缓存（备份到 backup-ui-state-*）?", default=True):
+        result = doctor.reset_ui_state()
+        if result["moved"]:
+            ok(f"已备份并清除 {len(result['moved'])} 项：{' / '.join(result['moved'])}")
+            dim(f"      备份目录：{result['backup_dir']}")
+        for e in result["errors"]:
+            err(f"  {e}")
+    else:
+        dim("已跳过。若 Codex 里显示不对，可随时用菜单 6) 诊断与修复。")
+    print("")
+    dim("请完全退出 Codex（含托盘）后重新打开，并新建一个对话验证模型列表。")
+
+
+def run_doctor() -> None:
+    """Diagnose why Codex may not show the newly installed provider/model."""
+    head("诊断与修复")
+    diag = doctor.diagnose()
+    for f in diag.findings:
+        if f.level == "ok":
+            print(f"  {_paint('32', '[OK]')} {f.title}" + (f"  ({f.detail})" if f.detail else ""))
+        elif f.level == "warn":
+            print(f"  {_paint('33', '[!] ')} {f.title}" + (f"  ({f.detail})" if f.detail else ""))
+        else:
+            print(f"  {_paint('31', '[X] ')} {f.title}" + (f"  ({f.detail})" if f.detail else ""))
+        if f.fix and f.level in ("warn", "bad"):
+            dim(f"      → {f.fix}")
+    print("")
+
+    procs = doctor.find_codex_processes()
+    ui_files = doctor.ui_state_files()
+    web = doctor.desktop_web_dir()
+
+    if procs:
+        warn("请先完全退出 Codex / ChatGPT（含托盘图标），否则应用退出时可能覆盖 config.toml。")
+        if not confirm("仍要继续修复?", default=False):
+            dim("已取消。")
+            return
+
+    if not ui_files and not web.exists():
+        if diag.ok:
+            ok("没有发现明显问题。若 Codex 里仍不对，请完全退出应用后重新打开，并新建一个对话。")
+        else:
+            warn("按上面的提示处理后重试。")
+        return
+
+    print("  桌面端会把模型列表/provider 显示缓存在本地，改完配置后需清缓存再重启才会刷新：")
+    if ui_files:
+        print(f"    - UI 状态文件 {len(ui_files)} 个：{' / '.join(p.name for p in ui_files)}")
+    if web.exists():
+        print(f"    - Chromium 数据目录：{web}")
+    print("")
+
+    if not confirm("清理这些缓存并备份到 backup-ui-state-* ?", default=True):
+        dim("已取消，未改动任何文件。")
+        return
+
+    include_web = False
+    if web.exists():
+        include_web = confirm("同时清理 Chromium 数据目录（会重置界面偏好，但不影响配置/会话）?", default=False)
+
+    result = doctor.reset_ui_state(include_web=include_web)
+    if result["errors"]:
+        for e in result["errors"]:
+            err(f"  {e}")
+    if result["moved"]:
+        ok(f"已备份并清除 {len(result['moved'])} 项：{' / '.join(result['moved'])}")
+        dim(f"      备份目录：{result['backup_dir']}")
+    else:
+        warn("没有可清理的缓存。")
+    print("")
+    ok("请现在完全退出 Codex（含托盘），再重新打开，并新建一个对话查看模型列表。")
+
+
 def main_menu() -> None:
     global _active
     print("")
@@ -610,6 +731,7 @@ def main_menu() -> None:
         warn("请先安装并运行一次 Codex CLI / ChatGPT 桌面端 / VS Code Codex 插件")
         warn("（首次运行会自动创建该目录），或设置 CODEX_HOME 环境变量后重试。")
         print("      npm install -g @openai/codex")
+        _pause()
         return
 
     bad_menu = 0
@@ -622,9 +744,9 @@ def main_menu() -> None:
         print("    3) 切换默认模型")
         print("    4) 回退（恢复运行前原状）")
         print("    5) 查看当前状态")
-        print("    6) 自测")
+        print("    6) 诊断与修复（Codex 里不显示新模型 / provider 不对时用）")
         print("    7) 退出")
-        choice = input("  请输入 [1-7] ").strip()
+        choice = _read("  请输入 [1-7] ").strip()
         if choice == "7":
             print("  再见。")
             return
@@ -637,6 +759,13 @@ def main_menu() -> None:
             key = service.get_api_key(prov, interactive_prompt=lambda: prompt_api_key(prov))
             if not key:
                 continue
+            procs = doctor.find_codex_processes()
+            if procs:
+                warn("检测到 Codex / ChatGPT 正在运行：" + " / ".join(procs))
+                warn("桌面端退出时可能把 config.toml 覆盖回去，建议先完全退出（含托盘图标）。")
+                if not confirm("仍要在 Codex 运行时继续写入?", default=False):
+                    dim("已取消，未写入任何文件。")
+                    continue
             reg = registry.load(paths.registry_path())
             reg_providers = reg.get("providers") if reg and isinstance(reg.get("providers"), list) else []
             entry = next((rp for rp in reg_providers if isinstance(rp, dict) and rp.get("id") == prov.id), None)
@@ -648,6 +777,7 @@ def main_menu() -> None:
                     if merged:
                         prov.models = list(merged)
             service.install_provider(prov, key)
+            _post_install_hint(prov)
             continue
 
         if choice == "2":
@@ -661,7 +791,7 @@ def main_menu() -> None:
                 mdl = f"，模型: {' / '.join(rec.get('models') or [])}" if rec.get("models") else ""
                 print(f"   {i}) {shown}  ({rec.get('base_url')}{mdl})")
             print(f"   {len(records) + 1}) 返回")
-            raw = input(f"  请输入 [1-{len(records) + 1}] ").strip()
+            raw = _read(f"  请输入 [1-{len(records) + 1}] ").strip()
             try:
                 idx = int(raw)
             except ValueError:
@@ -689,7 +819,7 @@ def main_menu() -> None:
                     continue
                 head("选择默认模型（该 provider 无模型记录，直接输入已注册模型名）")
                 dim(f"   已注册: {' / '.join(slugs)}")
-                slug_in = input("   模型名 ").strip()
+                slug_in = _read("   模型名 ").strip()
                 if not slug_in or slug_in not in slugs:
                     warn("模型未在 models.json 注册，已取消。")
                     continue
@@ -699,7 +829,7 @@ def main_menu() -> None:
             head("选择默认模型（只改 config.toml 顶部的 model 一行）")
             for i, slug in enumerate(prov.models, 1):
                 print(f"   {i}) {slug}")
-            raw = input(f"  请输入 [1-{len(prov.models)}] ").strip()
+            raw = _read(f"  请输入 [1-{len(prov.models)}] ").strip()
             try:
                 idx = int(raw)
             except ValueError:
@@ -730,7 +860,7 @@ def main_menu() -> None:
             continue
 
         if choice == "6":
-            warn("内置自测已迁移为 pytest：请运行 .\\.venv\\Scripts\\python.exe -m pytest")
+            run_doctor()
             continue
 
         bad_menu += 1

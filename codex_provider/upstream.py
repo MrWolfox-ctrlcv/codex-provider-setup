@@ -16,6 +16,14 @@ CONTEXT_WINDOW_KEYS = (
     "input_token_limit",
 )
 
+# Some gateways (New-API 中转站、CDN/WAF) reject the default
+# "Python-urllib/3.x" User-Agent with 400/403.  Send a browser-like UA so
+# such providers behave identically to a normal OpenAI-compatible client.
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
 
 def _normalize_base(base_url: str) -> str:
     return base_url.strip().rstrip("/") + "/"
@@ -79,7 +87,10 @@ def fetch_models(base_url: str, api_key: str, timeout: int = 20) -> dict:
     last_error = ""
     for uri in uris:
         try:
-            headers = {"Authorization": f"Bearer {api_key}"}
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": BROWSER_UA,
+            }
             req = request.Request(uri, headers=headers)
             with request.urlopen(req, timeout=timeout) as resp:
                 raw = json.loads(resp.read().decode("utf-8"))
@@ -97,7 +108,11 @@ def probe_model(
     body = json.dumps(
         {"model": slug, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}
     ).encode("utf-8")
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": BROWSER_UA,
+    }
     req = request.Request(uri, data=body, method="POST", headers=headers)
     try:
         with request.urlopen(req, timeout=timeout):

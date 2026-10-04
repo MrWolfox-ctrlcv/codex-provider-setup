@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback
+from pathlib import Path
 
 from codex_provider import interact, paths, presets, registry, service, upstream
 from codex_provider.heuristics import default_reasoning_levels, likely_vision
+from codex_provider.interact import err
 from codex_provider.provider import Provider
 
 
@@ -24,7 +27,7 @@ def _build_parser() -> argparse.ArgumentParser:
     install.add_argument("--vision", action="store_true")
     install.add_argument("--short-instructions", action="store_true")
     install.add_argument("--enable-search", action="store_true")
-    install.add_argument("--preset", type=int, help="1 = DeepSeek 官方")
+    install.add_argument("--preset", type=int, help="1 = DeepSeek 官方，2 = Wolfox AI（https://api.wolfoxlabs.xyz）")
 
     switch = sub.add_parser("switch", help="切换默认模型（只改 config.toml 顶部 model 一行）")
     switch.add_argument("model")
@@ -41,6 +44,13 @@ def _build_parser() -> argparse.ArgumentParser:
     prune.add_argument("--provider-id", required=True)
 
     sub.add_parser("selftest", help="运行内置自测")
+
+    doc = sub.add_parser("doctor", help="诊断 Codex 为何不显示新接入的 provider/模型")
+    doc.add_argument("--fix", action="store_true", help="清理桌面端 UI 状态缓存（备份后清除）")
+    doc.add_argument("--include-web", action="store_true", help="连同桌面端 Chromium 数据目录一起清理")
+    doc.add_argument("--json", action="store_true", help="以 JSON 输出诊断结果")
+    doc.add_argument("--restore-ui", action="store_true", help="从最近的备份恢复桌面端 UI 状态")
+    doc.add_argument("--from", dest="restore_from", help="指定 backup-ui-state-* 目录（配合 --restore-ui）")
     return p
 
 
@@ -105,8 +115,10 @@ def _cmd_install(args) -> int:
     if args.preset:
         if args.preset == 1:
             prov = presets.deepseek_preset()
+        elif args.preset == 2:
+            prov = presets.wolfox_preset()
         else:
-            raise SystemExit("预设仅支持 1 = DeepSeek 官方；其它请走完全自定义（--provider-id + --base-url）。")
+            raise SystemExit("预设支持 1 = DeepSeek 官方、2 = Wolfox AI；其它请走完全自定义（--provider-id + --base-url）。")
         _apply_registry_overrides(prov)
     elif args.provider_id and args.base_url:
         prov = _build_param_provider(args)
@@ -143,7 +155,184 @@ def _cmd_provider_op(args, op) -> int:
     return 0
 
 
+def _log_crash(exc: BaseException) -> None:
+    """Write the full traceback to a log file next to the user's codex home."""
+    import traceback
+    from codex_provider.service import SCRIPT_VERSION
+
+    try:
+        log_path = paths.codex_home() / "codex-provider-setup-crash.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write("=" * 60 + "\n")
+            fh.write(f"codex-provider-setup crash log (version {SCRIPT_VERSION})\n")
+            traceback.print_exc(file=fh)
+        return log_path
+    except Exception:
+        return None
+
+
+def _pause_before_exit() -> None:
+    """Keep the console window open on Windows so users can read errors.
+
+    Must never raise: this runs while an error is already being reported, and a
+    failure here would hide the real message.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, True)
+    except Exception:
+        pass
+    try:
+        input("  按回车键退出...")
+    except (EOFError, OSError, KeyboardInterrupt):
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except interact.AbortError as exc:
+        print("")
+        err(str(exc))
+        err("没有写入或修改任何文件。")
+        print("")
+        _pause_before_exit()
+        return 2
+    except KeyboardInterrupt:
+        print("")
+        warn("已中断。")
+        _pause_before_exit()
+        return 130
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - last-resort guard: never flash-crash
+        print("")
+        err(f"程序发生未预期的错误：{exc}")
+        err("已将详细错误写入日志，请把下面日志发给开发者排查：")
+        log_path = _log_crash(exc)
+        if log_path:
+            err(f"  日志文件：{log_path}")
+        print("")
+        traceback.print_exc()
+        print("")
+        _pause_before_exit()
+        return 1
+
+
+def _cmd_doctor(args) -> int:
+    import json as _json
+
+    from codex_provider import doctor
+
+    as_json = bool(getattr(args, "json", False))
+
+    def say(kind: str, msg: str) -> None:
+        """Suppress prose in JSON mode so stdout stays machine-readable."""
+        if as_json:
+            return
+        {"ok": interact.ok, "warn": interact.warn, "err": interact.err}[kind](msg)
+
+    diag = doctor.diagnose()
+    payload: dict = {
+        "ok": diag.ok,
+        "codex_home": str(paths.codex_home()),
+        "findings": [
+            {"level": f.level, "title": f.title, "detail": f.detail, "fix": f.fix}
+            for f in diag.findings
+        ],
+    }
+
+    if not as_json:
+        print("")
+        print(f"Codex 配置目录: {paths.codex_home()}")
+        print("")
+        for f in diag.findings:
+            tag = {"ok": "[OK]", "warn": "[!] ", "bad": "[X] "}[f.level]
+            line = f"  {tag} {f.title}"
+            if f.detail:
+                line += f"  ({f.detail})"
+            print(line)
+            if f.fix and f.level in ("warn", "bad"):
+                print(f"        → {f.fix}")
+        print("")
+
+    if getattr(args, "restore_ui", False):
+        procs = doctor.find_codex_processes()
+        if procs:
+            say("warn", "检测到 Codex / ChatGPT 正在运行：" + " / ".join(procs))
+            say("warn", "请先完全退出（含托盘）再恢复，否则会被应用覆盖。")
+            if as_json:
+                payload["restore_ui"] = {"errors": ["Codex 正在运行，已跳过"], "restored_keys": []}
+                print(_json.dumps(payload, ensure_ascii=True, indent=2))
+            return 2
+        src = Path(args.restore_from) if getattr(args, "restore_from", None) else None
+        result = doctor.restore_ui_state(src)
+        for e in result["errors"]:
+            say("err", f"  {e}")
+        if result["restored_keys"]:
+            say("ok", f"已从 {result['source'].parent.name} 恢复 {len(result['restored_keys'])} 个键：")
+            for k in result["restored_keys"]:
+                print(f"      - {k}")
+            if result["backup_of_current"]:
+                print(f"      当前状态已先备份到：{result['backup_of_current']}")
+            say("warn", "请重新打开 Codex 查看。")
+        elif not result["errors"]:
+            say("ok", "没有需要恢复的键（当前状态已包含备份内容）。")
+        if as_json:
+            payload["restore_ui"] = {
+                "restored_keys": result["restored_keys"],
+                "source": str(result["source"]) if result["source"] else None,
+                "backup_of_current": str(result["backup_of_current"]) if result["backup_of_current"] else None,
+                "errors": result["errors"],
+            }
+            print(_json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0 if not result["errors"] else 1
+
+    if not getattr(args, "fix", False):
+        if as_json:
+            # JSON mode stays machine-readable: no prose on stdout.
+            print(_json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0 if diag.ok else 1
+        if not diag.ok:
+            interact.warn("发现问题。可加 --fix 清理桌面端缓存（会先备份），然后完全退出 Codex 再打开。")
+            return 1
+        interact.ok("未发现明显问题。若 Codex 里仍不对，请完全退出应用后重开并新建对话。")
+        return 0
+
+    procs = doctor.find_codex_processes()
+    if procs:
+        say("warn", "检测到 Codex / ChatGPT 正在运行：" + " / ".join(procs))
+        say("warn", "请先完全退出（含托盘）再清理，否则可能被覆盖。")
+        if as_json:
+            payload["fix"] = {"errors": ["Codex 正在运行，已跳过"], "moved": []}
+            print(_json.dumps(payload, ensure_ascii=True, indent=2))
+        return 2
+
+    result = doctor.reset_ui_state(include_web=getattr(args, "include_web", False))
+    if result["moved"]:
+        say("ok", f"已备份并清除 {len(result['moved'])} 项：{' / '.join(result['moved'])}")
+        if not as_json:
+            print(f"      备份目录：{result['backup_dir']}")
+    else:
+        say("warn", "没有可清理的桌面端缓存。")
+    for e in result["errors"]:
+        say("err", f"  {e}")
+    say("ok", "请完全退出 Codex（含托盘）后重新打开，并新建一个对话验证模型列表。")
+    if as_json:
+        payload["fix"] = {
+            "moved": result["moved"],
+            "backup_dir": str(result["backup_dir"]) if result["backup_dir"] else None,
+            "errors": result["errors"],
+        }
+        print(_json.dumps(payload, ensure_ascii=True, indent=2))
+    return 0
+
+
+def _main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command is None:
         interact.main_menu()
@@ -167,6 +356,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "selftest":
         interact.warn("内置自测已迁移为 pytest：请运行 .\\.venv\\Scripts\\python.exe -m pytest")
         return 0
+    if args.command == "doctor":
+        return _cmd_doctor(args)
     return 0
 
 

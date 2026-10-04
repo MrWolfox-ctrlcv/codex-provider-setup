@@ -161,13 +161,26 @@ def test_keep_non_target_multiline():
     tomllib.loads(r.text)
 
 
-def test_fix_wire_api_chat_in_section():
-    src = '[model_providers.other]\nname = "other"\nwire_api = "chat"\n'
-    r = edit_config(src, "x", "https://x", "responses", True, "XK", "sk", "m", "high", CATALOG, True)
-    assert 'wire_api = "responses"' in r.text
-    assert 'wire_api = "chat"' not in r.text
-    assert "Fixed wire_api" in r.report[0]
+def test_other_provider_wire_api_is_left_untouched():
+    """Installing one provider must not rewrite another provider's wire_api:
+    many OpenAI-compatible relays only speak chat completions."""
+    src = '[model_providers.other]\nname = "other"\nbase_url = "https://r/v1"\nwire_api = "chat"\n'
+    r = edit_config(src, "wolfox", "https://api.wolfoxlabs.xyz/v1", "chat",
+                    False, "", "sk-w", "spe/deepseek-v4-flash", "high", CATALOG, False)
+    assert '[model_providers.other]' in r.text
+    other_sec = r.text.split("[model_providers.other]")[1].split("[")[0]
+    assert 'wire_api = "chat"' in other_sec
+    assert "Fixed wire_api" not in "\n".join(r.report)
     tomllib.loads(r.text)
+
+
+def test_target_provider_wire_api_matches_provider():
+    src = '[model_providers.other]\nwire_api = "chat"\n'
+    r = edit_config(src, "wolfox", "https://api.wolfoxlabs.xyz/v1", "chat",
+                    False, "", "sk-w", "spe/deepseek-v4-flash", "high", CATALOG, False)
+    wolfox_sec = r.text.split("[model_providers.wolfox]")[1]
+    assert 'wire_api = "chat"' in wolfox_sec
+    assert 'wire_api = "responses"' not in r.text
 
 
 def test_remove_del_a_and_report():

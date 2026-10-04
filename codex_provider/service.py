@@ -9,10 +9,10 @@ from pathlib import Path
 from typing import Callable
 
 from codex_provider import backup, catalog, env_os, paths, registry, toml_edit, upstream
-from codex_provider.io_utils import atomic_write, read_json, read_text
+from codex_provider.io_utils import atomic_write, read_json, read_text, sanitize_ctrl
 from codex_provider.provider import Provider
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 
 Echo = Callable[[str], None]
 
@@ -188,6 +188,10 @@ def install_provider(
     config_path = paths.config_path()
     models_path = paths.models_path()
     backup_dir = paths.backup_dir(provider.id)
+
+    # Keys copied from a web console can carry invisible control characters;
+    # clean once so the TOML value and the persisted env var stay identical.
+    api_key = sanitize_ctrl(api_key)
 
     orig_config_existed = config_path.exists()
     orig_models_existed = models_path.exists()

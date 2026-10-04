@@ -124,7 +124,8 @@ def test_e2e_seed_and_install_mimo(tmp_codex_home):
     assert 'experimental_bearer_token = "sk-test"' in cfg
     assert "[model_providers.other]" in cfg
     other_sec = cfg.split("[model_providers.other]")[1].split("[")[0]
-    assert 'wire_api = "responses"' in other_sec
+    # other providers keep their own wire_api (SAMPLE_CFG has chat for "other")
+    assert 'wire_api = "chat"' in other_sec
     assert "[desktop]" in cfg
     assert 'localeOverride = "zh-CN"' in cfg
     assert 'trust_level = "trusted"' in cfg
@@ -272,3 +273,69 @@ def test_e2e_restore(tmp_codex_home):
     assert paths.config_path().read_bytes() == cfg_bytes
     assert paths.models_path().read_bytes() == mdl_bytes
     assert not paths.backup_dir("mimo").exists()
+
+
+def test_e2e_install_with_polluted_config(tmp_codex_home):
+    """Reproduces the friend's crash: existing config.toml contains an illegal
+    control character (\\x16 from copy-paste).  Install must sanitize it and
+    succeed instead of aborting on TOML validation."""
+    polluted = SAMPLE_CFG.replace('openai_base_url = "https://api.openai.com/v1"',
+                                  'openai_base_url = "https://api.openai.com/v1"\x16')
+    write_text(paths.config_path(), polluted)
+    p = make_mimo()
+    service.install_provider(p, "sk-selftest-key", in_selftest=True)
+    cfg = read_text(paths.config_path())
+    assert "\x16" not in cfg
+    assert "openai_base_url" not in cfg  # still stripped by edit_config
+    assert 'model = "mimo-v2.5-pro"' in cfg
+    assert 'model_provider = "mimo"' in cfg
+    assert "[model_providers.mimo]" in cfg
+    data = read_json(paths.models_path())
+    assert any(m["slug"] == "mimo-v2.5-pro" for m in data["models"])
+
+
+def test_e2e_install_with_polluted_models_json(tmp_codex_home):
+    """Friend case: models.json written by a Windows tool carries a UTF-8 BOM
+    (and possibly control chars).  read_text must strip them so read_json parses
+    and install proceeds."""
+    _seed_home()
+    from codex_provider.presets import wolfox_preset
+
+    # rewrite models.json with a BOM prefix (like PowerShell Set-Content -Encoding UTF8)
+    bom_path = paths.models_path()
+    original = bom_path.read_bytes()
+    if not original.startswith(b"\xef\xbb\xbf"):
+        bom_path.write_bytes(b"\xef\xbb\xbf" + original)
+    # also inject a control char into config for good measure
+    cfg = paths.config_path().read_text(encoding="utf-8")
+    cfg = cfg.replace("openai_base_url = \"https://api.openai.com/v1\"",
+                      "openai_base_url = \"https://api.openai.com/v1\"\x16")
+    paths.config_path().write_text(cfg, encoding="utf-8")
+
+    p = wolfox_preset()
+    service.install_provider(p, "sk-test-key", in_selftest=True)
+    out_cfg = read_text(paths.config_path())
+    assert "\ufeff" not in out_cfg
+    assert "\x16" not in out_cfg
+    assert 'model = "spe/deepseek-v4-flash"' in out_cfg
+    assert 'model_provider = "wolfox"' in out_cfg
+    data = read_json(paths.models_path())
+    assert any(m["slug"] == "spe/deepseek-v4-flash" for m in data["models"])
+    assert any(m["slug"] == "spe/deepseek-v4-pro" for m in data["models"])
+
+
+def test_e2e_install_with_polluted_api_key(tmp_codex_home):
+    """The real friend case: the \x16 rides in via the pasted API key, not the
+    config file.  Install must sanitize the key and succeed."""
+    _seed_home()
+    from codex_provider.presets import wolfox_preset
+
+    p = wolfox_preset()
+    dirty_key = "sk-abc\x16def"  # user copied the key from a web console
+    service.install_provider(p, dirty_key, in_selftest=True)
+    cfg = read_text(paths.config_path())
+    assert "\x16" not in cfg
+    assert 'experimental_bearer_token = "sk-abcdef"' in cfg
+    assert 'model = "spe/deepseek-v4-flash"' in cfg
+    assert 'model_provider = "wolfox"' in cfg
+    assert "[model_providers.wolfox]" in cfg

@@ -73,6 +73,7 @@ def make_handler(routes: dict) -> tuple[type, list]:
                         "path": self.path,
                         "auth": self.headers.get("Authorization"),
                         "content_type": self.headers.get("Content-Type"),
+                        "user_agent": self.headers.get("User-Agent"),
                         "body": body,
                     }
                 )
@@ -158,6 +159,7 @@ def test_fetch_models_success(serve):
     assert req["method"] == "GET"
     assert req["path"] == "/models"
     assert req["auth"] == "Bearer sk-test"
+    assert req["user_agent"] == upstream.BROWSER_UA
 
 
 @pytest.mark.parametrize("suffix", ["/v1", "/v1/"])
@@ -207,6 +209,7 @@ def test_probe_model_usable(serve):
     assert req["path"] == "/chat/completions"
     assert req["auth"] == "Bearer sk-test"
     assert req["content_type"] == "application/json"
+    assert req["user_agent"] == upstream.BROWSER_UA
     assert json.loads(req["body"]) == {
         "model": "demo-model",
         "messages": [{"role": "user", "content": "hi"}],

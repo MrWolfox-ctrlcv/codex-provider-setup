@@ -217,14 +217,11 @@ def edit_config(
                 st.scan(line)
                 idx += 1
                 continue
-            k = _key_of(line)
-            if k == "wire_api" and _value_of(trimmed).startswith(('"chat"', "'chat'")):
-                indent = line[: len(line) - len(line.lstrip())]
-                out.append(f'{indent}wire_api = "responses"')
-                report.append(f'Fixed wire_api in [{cur_section}]: "chat" -> "responses"')
-                st.scan(line)
-                idx += 1
-                continue
+            # NOTE: wire_api of *other* providers is intentionally left untouched.
+            # Rewriting "chat" -> "responses" here silently broke unrelated
+            # OpenAI-compatible relays (many only support chat completions).
+            # The section we install is rewritten wholesale at the end of this
+            # function with the provider's own wire_api value.
             out.append(line)
             st.scan(line)
             idx += 1

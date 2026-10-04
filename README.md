@@ -19,8 +19,13 @@
 - **上游 /models 同步与探活清理**：`sync` 把上游新出现的模型增量并入；`prune` 逐个发
   最小请求探测当前 Key 实际可用性，剔除 401/402/403/404 的模型（限流/5xx 视为不确定，
   不自动删除）。
-- **DeepSeek 预设 + 完全自定义**：`--preset 1` 直连 DeepSeek 官方；或完全自定义任意
+- **DeepSeek 官方 / Wolfox AI 预设 + 完全自定义**：`--preset 1` 直连 DeepSeek 官方；
+  `--preset 2` 直连 Wolfox AI（https://api.wolfoxlabs.xyz）；或完全自定义任意
   provider id / base_url / 模型 / API Key。
+- **`doctor` 诊断与桌面端缓存修复**：接入后 Codex 里看不到新模型或 provider 显示不对时，
+  `doctor` 逐项定位原因；`doctor --fix` 备份后清理桌面端 UI 状态缓存，重启应用即生效。
+- **脏数据自愈**：源 `config.toml` / `models.json` 或从网页复制的 API Key 若混入
+  不可见控制字符（如 `\x16`）或 UTF-8 BOM，会在写入前自动清理，不因此中断接入。
 - **纯标准库、零运行时依赖**：仅用 Python 标准库实现，安装即用。
 
 ## 运行前提
@@ -63,6 +68,12 @@ DeepSeek 官方预设，`--preset 1`（API Key 写入 `experimental_bearer_token
 codex-provider-setup install --preset 1
 ```
 
+Wolfox AI 预设（自家站，https://api.wolfoxlabs.xyz，chat 接口），`--preset 2`：
+
+```powershell
+codex-provider-setup install --preset 2
+```
+
 完全自定义（显式给出模型列表）：
 
 ```powershell
@@ -87,7 +98,24 @@ codex-provider-setup status                      # 查看当前状态
 codex-provider-setup restore --provider-id <id>  # 回退到该 provider 接入前的状态
 codex-provider-setup sync --provider-id <id>     # 免交互：把上游 /models 新模型并入已接入的 provider
 codex-provider-setup prune --provider-id <id>    # 免交互：探测并移除当前 Key 不可用的模型
+codex-provider-setup doctor                      # 诊断：Codex 里不显示新模型 / provider 不对
+codex-provider-setup doctor --fix                # 诊断并清理桌面端 UI 状态缓存（备份后清除）
 ```
+
+## 接入后 Codex 里看不到新模型？
+
+Codex 桌面端是 Electron 应用，会把**模型列表与 provider 显示**缓存在
+`~/.codex/.codex-global-state.json` 里，并且只有在**完全退出后重新启动**时才会重新读取
+`config.toml`。因此接入成功后请：
+
+1. **完全退出** Codex / ChatGPT（含托盘图标，确认任务管理器里没有 `Codex.exe`）；
+2. 重新打开，并**新建一个对话**（旧对话会保留它自己原来的模型）；
+3. 若左下角或模型列表仍不对，运行 `codex-provider-setup doctor` 查看原因，
+   再用 `doctor --fix` 清理缓存（会先备份到 `~/.codex/backup-ui-state-<时间戳>/`，可随时还原）。
+
+`doctor` 会逐项检查：`config.toml` 能否解析、`model` / `model_provider` 是否设置、
+`[model_providers.<id>]` 段与凭据是否存在、`model_catalog_json` 是否为**绝对路径**且包含默认模型、
+是否有 Codex 进程正在运行（可能导致配置被覆盖）、以及桌面端缓存是否需要清理。
 
 ## 跨平台说明
 

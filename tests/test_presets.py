@@ -4,7 +4,7 @@ import base64
 import re
 from pathlib import Path
 
-from codex_provider.presets import deepseek_preset, load_codex_instructions
+from codex_provider.presets import deepseek_preset, load_codex_instructions, wolfox_preset
 
 PS1 = Path(r"E:\aiPic\setup-codex-provider.ps1")
 PROMPT_FILE = Path(__file__).resolve().parent.parent / "codex_provider" / "prompts" / "codex_instructions.txt"
@@ -40,6 +40,30 @@ def test_deepseek_preset_fields():
     assert p.base_instructions == load_codex_instructions()
 
 
+def test_wolfox_preset_fields():
+    p = wolfox_preset()
+    assert p.id == "wolfox"
+    assert p.name == "Wolfox AI"
+    assert p.base_url == "https://api.wolfoxlabs.xyz/v1"
+    assert p.key_prefix == "sk-"
+    assert p.env_var_name == "WOLFOX_API_KEY"
+    assert p.use_env_key is False
+    assert p.models == ["spe/deepseek-v4-flash", "spe/deepseek-v4-pro"]
+    assert p.wire_api == "chat"
+    assert p.context_window == 1048576
+    assert p.vision is False
+    assert p.instructions_mode == "full"
+    assert p.reasoning_levels == ["low", "high", "max"]
+    assert p.apply_patch_tool_type == "freeform"
+    assert p.search_support is False
+    assert p.disable_web_search is True
+    assert p.parallel_tool_calls is True
+    assert p.support_verbosity is False
+    assert p.truncation_mode == "tokens"
+    assert p.description == "Wolfox AI API"
+    assert p.base_instructions == load_codex_instructions()
+
+
 def test_deepseek_preset_instances_are_independent():
     a = deepseek_preset()
     b = deepseek_preset()
@@ -53,6 +77,24 @@ def test_deepseek_preset_instances_are_independent():
     a.vision_by_model["x"] = True
     a.meta_overrides["y"] = {"context_window": 1}
     assert b.models == ["deepseek-v4-flash", "deepseek-v4-pro"]
+    assert b.reasoning_levels == ["low", "high", "max"]
+    assert b.vision_by_model == {}
+    assert b.meta_overrides == {}
+
+
+def test_wolfox_preset_instances_are_independent():
+    a = wolfox_preset()
+    b = wolfox_preset()
+    assert a is not b
+    assert a.models is not b.models
+    assert a.reasoning_levels is not b.reasoning_levels
+    assert a.vision_by_model is not b.vision_by_model
+    assert a.meta_overrides is not b.meta_overrides
+    a.models.append("extra")
+    a.reasoning_levels.append("ultra")
+    a.vision_by_model["x"] = True
+    a.meta_overrides["y"] = {"context_window": 1}
+    assert b.models == ["spe/deepseek-v4-flash", "spe/deepseek-v4-pro"]
     assert b.reasoning_levels == ["low", "high", "max"]
     assert b.vision_by_model == {}
     assert b.meta_overrides == {}
