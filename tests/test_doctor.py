@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 from codex_provider import doctor, paths
 from codex_provider.io_utils import write_text
@@ -162,12 +163,28 @@ def test_reset_ui_state_can_include_web_dir(tmp_codex_home, monkeypatch, tmp_pat
 
 
 def test_find_codex_processes_ignores_self(monkeypatch):
-    class R:
-        stdout = '"codex.exe","123","Console","1","1,000 K"\n"codex-provider-setup.exe","456","Console","1","1 K"\n"explorer.exe","789","Console","1","1 K"\n'
+    """Windows parses tasklist's CSV; other platforms take `ps` output verbatim.
+
+    The fake output must match the branch the running platform actually uses,
+    otherwise the assertion only holds on Windows.
+    """
+    if sys.platform == "win32":
+        class R:
+            stdout = (
+                '"codex.exe","123","Console","1","1,000 K"\n'
+                '"codex-provider-setup.exe","456","Console","1","1 K"\n'
+                '"explorer.exe","789","Console","1","1 K"\n'
+            )
+    else:
+        class R:
+            stdout = "codex\ncodex-provider-setup\nexplorer\n"
 
     monkeypatch.setattr(doctor.subprocess, "run", lambda *a, **k: R())
     procs = doctor.find_codex_processes()
-    assert procs == ["codex.exe"]
+    # This tool must never report itself as a running Codex instance.
+    assert len(procs) == 1
+    assert "provider-setup" not in procs[0].lower()
+    assert "codex" in procs[0].lower()
 
 
 def test_diagnose_flags_running_codex(monkeypatch, tmp_codex_home):

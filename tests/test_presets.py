@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import base64
+import os
 import re
 from pathlib import Path
 
+import pytest
+
 from codex_provider.presets import deepseek_preset, load_codex_instructions, wolfox_preset
 
-PS1 = Path(r"E:\aiPic\setup-codex-provider.ps1")
+# The legacy PowerShell script this project was ported from.  It lives outside
+# the repository (it was the migration source, not a shipped artifact), so the
+# comparison test can only run where a developer actually has it.  Overridable
+# so other checkouts do not need this exact path.
+PS1 = Path(os.environ.get("CODEX_SETUP_PS1", r"E:\aiPic\setup-codex-provider.ps1"))
 PROMPT_FILE = Path(__file__).resolve().parent.parent / "codex_provider" / "prompts" / "codex_instructions.txt"
 
 
@@ -116,6 +123,10 @@ def test_prompt_file_utf8_no_bom_readable():
     assert len(text) > 15000
 
 
+@pytest.mark.skipif(
+    not PS1.is_file(),
+    reason="legacy setup-codex-provider.ps1 not present (lives outside the repo)",
+)
 def test_prompt_file_matches_ps1_decoded():
     expected = _ps1_instructions()
     raw = PROMPT_FILE.read_bytes()
