@@ -522,3 +522,187 @@ def test_print_helpers_never_raise_on_unencodable_console(monkeypatch):
     # Must not raise.
     interact.ok("中文消息")
     interact.err("中文错误")
+
+
+# --------------------------------------------------------------------------
+# Catalog housekeeping: garbage accumulates in models.json, and the
+# per-channel removal path cannot reach it.  Channels must never be touched.
+# --------------------------------------------------------------------------
+
+
+def _seed_catalog_with_garbage(tmp_codex_home) -> None:
+    """Two channels plus orphan / shared / hand-added catalog entries."""
+    seed_user_config(tmp_codex_home)
+    service.install_provider(make_channel("chan1", models=["shared", "only-1"]), "k1", in_selftest=True)
+    service.install_provider(make_channel("chan2", "https://b/v1", ["shared", "only-2"]), "k2", in_selftest=True)
+    # Simulate history: entries left behind by channels that no longer exist,
+    # plus a hand-added one.  These are unreachable from the per-channel menus.
+    data = json.loads(paths.models_path().read_text(encoding="utf-8"))
+    for slug in ("orphan-a", "orphan-b", "hand-added"):
+        data["models"].append({"slug": slug, "context_window": 4096})
+    paths.models_path().write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_orphan_detection(tmp_codex_home):
+    _seed_catalog_with_garbage(tmp_codex_home)
+    assert sorted(service.orphan_models()) == ["hand-added", "orphan-a", "orphan-b"]
+    assert service.shared_models() == {"shared": ["chan1", "chan2"]}
+
+
+def test_remove_catalog_models_deletes_arbitrary_entries(tmp_codex_home):
+    _seed_catalog_with_garbage(tmp_codex_home)
+    service.remove_catalog_models(["orphan-a", "hand-added"])
+    assert sorted(slugs()) == ["only-1", "only-2", "orphan-b", "shared"]
+
+
+def test_remove_catalog_models_refuses_to_drop_the_default_model(tmp_codex_home):
+    _seed_catalog_with_garbage(tmp_codex_home)
+    service.switch_default_model("only-1")
+    with pytest.raises(ValueError):
+        service.remove_catalog_models(["only-1"])
+    assert "only-1" in slugs()
+
+
+def test_remove_catalog_models_never_touches_channels(tmp_codex_home):
+    _seed_catalog_with_garbage(tmp_codex_home)
+    before = paths.config_path().read_text(encoding="utf-8")
+    # "shared" is the installed default model (protected), so also drop a
+    # channel-owned non-default entry to prove arbitrary slugs are removable.
+    service.remove_catalog_models(["orphan-a", "only-2"])
+    # config.toml is byte-identical: credentials, base_url and sections intact.
+    assert paths.config_path().read_text(encoding="utf-8") == before
+    reg = json.loads(paths.registry_path().read_text(encoding="utf-8"))
+    assert [p["id"] for p in reg["providers"]] == ["chan1", "chan2"]
+    assert "only-2" not in slugs()
+
+
+def test_remove_catalog_models_takes_a_safety_snapshot(tmp_codex_home):
+    _seed_catalog_with_garbage(tmp_codex_home)
+    service.remove_catalog_models(["orphan-a"])
+    assert any(p.name.startswith("safety-") for p in paths.codex_home().iterdir())
+
+
+def test_prune_orphans_only_removes_unowned(tmp_codex_home):
+    _seed_catalog_with_garbage(tmp_codex_home)
+    removed = service.prune_orphan_models(confirm=lambda: True)
+    assert removed == 3
+    assert sorted(slugs()) == ["only-1", "only-2", "shared"]
+
+
+def test_reset_catalog_keeps_every_channel_model(tmp_codex_home):
+    _seed_catalog_with_garbage(tmp_codex_home)
+    service.reset_catalog_to_channels(confirm=lambda: True)
+    remaining = sorted(slugs())
+    # Shared and per-channel models survive; only unowned entries go.
+    assert remaining == ["only-1", "only-2", "shared"]
+    cfg = tomllib.loads(paths.config_path().read_text(encoding="utf-8"))
+    assert sorted(cfg["model_providers"]) == ["chan1", "chan2"]
+
+
+def test_reset_catalog_preserves_default_model_without_owner(tmp_codex_home):
+    """A default model nobody claims must survive, or Codex loses its model."""
+    seed_user_config(tmp_codex_home)
+    service.install_provider(make_channel("chan1", models=["m1"]), "k", in_selftest=True)
+    data = json.loads(paths.models_path().read_text(encoding="utf-8"))
+    data["models"].append({"slug": "lonely-default"})
+    paths.models_path().write_text(json.dumps(data), encoding="utf-8")
+    service.switch_default_model("lonely-default")
+
+    service.reset_catalog_to_channels(confirm=lambda: True)
+
+    assert "lonely-default" in slugs()
+    assert tomllib.loads(paths.config_path().read_text(encoding="utf-8"))["model"] == "lonely-default"
+
+
+def test_reset_catalog_dry_run_writes_nothing(tmp_codex_home):
+    _seed_catalog_with_garbage(tmp_codex_home)
+    before = paths.models_path().read_text(encoding="utf-8")
+    service.reset_catalog_to_channels(confirm=None, dry_run=True)
+    assert paths.models_path().read_text(encoding="utf-8") == before
+    # only-1, shared, only-2 (channel-owned) + 3 unowned entries.
+    assert len(slugs()) == 6
+
+
+def test_prune_orphans_noop_when_clean(tmp_codex_home):
+    seed_user_config(tmp_codex_home)
+    service.install_provider(make_channel("chan1", models=["m1"]), "k", in_selftest=True)
+    assert service.orphan_models() == []
+    assert service.prune_orphan_models(confirm=lambda: True) == 0
+
+
+# --------------------------------------------------------------------------
+# Migration: model_catalog_json is an absolute path, so a config copied to a
+# machine with a different home directory points at a file that is not there
+# and Codex shows no models.  doctor --fix-path must repair exactly that line.
+# --------------------------------------------------------------------------
+
+
+def test_catalog_path_mismatch_detected(tmp_codex_home):
+    seed_user_config(tmp_codex_home)
+    service.install_provider(make_channel("chan1", models=["m1"]), "k", in_selftest=True)
+    assert service.catalog_path_mismatch() is None  # correct right after install
+
+    # Simulate a config carried over from another machine/username.
+    text = paths.config_path().read_text(encoding="utf-8")
+    paths.config_path().write_text(
+        text.replace(paths.catalog_value(), "C:/Users/SOMEONE_ELSE/.codex/models.json"),
+        encoding="utf-8",
+    )
+    mismatch = service.catalog_path_mismatch()
+    assert mismatch is not None
+    assert mismatch[0] == "C:/Users/SOMEONE_ELSE/.codex/models.json"
+    assert mismatch[1] == paths.catalog_value()
+
+
+def test_fix_catalog_path_rewrites_only_that_line(tmp_codex_home):
+    seed_user_config(tmp_codex_home)
+    service.install_provider(make_channel("chan1", models=["m1"]), "k", in_selftest=True)
+    text = paths.config_path().read_text(encoding="utf-8")
+    stale = text.replace(paths.catalog_value(), "C:/Users/SOMEONE_ELSE/.codex/models.json")
+    paths.config_path().write_text(stale, encoding="utf-8")
+
+    changed = service.fix_catalog_path()
+    assert changed is True
+    cfg = tomllib.loads(paths.config_path().read_text(encoding="utf-8"))
+    assert cfg["model_catalog_json"] == paths.catalog_value()
+    # Channels, credentials and the user's own sections are untouched.
+    assert sorted(cfg["model_providers"]) == ["chan1"]
+    assert cfg["model_providers"]["chan1"]["experimental_bearer_token"] == "k"
+    assert cfg["mcp_servers"]["filesystem"]["command"] == "npx"
+    assert service.catalog_path_mismatch() is None
+
+
+def test_fix_catalog_path_is_a_noop_when_correct(tmp_codex_home):
+    seed_user_config(tmp_codex_home)
+    service.install_provider(make_channel("chan1", models=["m1"]), "k", in_selftest=True)
+    before = paths.config_path().read_text(encoding="utf-8")
+    assert service.fix_catalog_path() is False
+    assert paths.config_path().read_text(encoding="utf-8") == before
+
+
+def test_fix_catalog_path_takes_a_safety_snapshot(tmp_codex_home):
+    seed_user_config(tmp_codex_home)
+    service.install_provider(make_channel("chan1", models=["m1"]), "k", in_selftest=True)
+    text = paths.config_path().read_text(encoding="utf-8")
+    paths.config_path().write_text(
+        text.replace(paths.catalog_value(), "C:/Users/OTHER/.codex/models.json"),
+        encoding="utf-8",
+    )
+    service.fix_catalog_path()
+    assert any(p.name.startswith("safety-") for p in paths.codex_home().iterdir())
+
+
+def test_doctor_reports_missing_catalog_path(tmp_codex_home):
+    """doctor must flag a stale path as a problem, not silently pass."""
+    from codex_provider import doctor
+
+    seed_user_config(tmp_codex_home)
+    service.install_provider(make_channel("chan1", models=["m1"]), "k", in_selftest=True)
+    text = paths.config_path().read_text(encoding="utf-8")
+    paths.config_path().write_text(
+        text.replace(paths.catalog_value(), "C:/Users/OTHER/.codex/models.json"),
+        encoding="utf-8",
+    )
+    diag = doctor.diagnose()
+    assert not diag.ok
+    assert any("model_catalog_json" in f.title for f in diag.findings if f.level == "bad")

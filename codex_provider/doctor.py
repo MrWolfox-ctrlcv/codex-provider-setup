@@ -211,6 +211,7 @@ def diagnose(provider_id: str | None = None) -> Diagnosis:
         d.add("warn", "config.toml 未设置 model_catalog_json", "", "重新运行本程序接入一次")
     else:
         catalog_path = Path(catalog_raw)
+        expected_catalog = paths.catalog_value()
         if not catalog_path.is_absolute():
             d.add(
                 "bad",
@@ -218,6 +219,23 @@ def diagnose(provider_id: str | None = None) -> Diagnosis:
                 catalog_raw,
                 "桌面端按自己的 CWD 解析相对路径会读不到模型列表，需改成绝对路径（本程序会写绝对路径）",
             )
+        elif catalog_raw.replace("\\", "/") != expected_catalog:
+            # Points somewhere other than this machine's models.json, which is
+            # what a copied config looks like after changing machine/username.
+            if not catalog_path.exists():
+                d.add(
+                    "bad",
+                    "model_catalog_json 指向的路径不存在（疑似换机器/换用户名后的旧路径）",
+                    catalog_raw,
+                    f"运行 doctor --fix-path 改写为本机路径：{expected_catalog}",
+                )
+            else:
+                d.add(
+                    "warn",
+                    "model_catalog_json 指向的不是本机 models.json",
+                    f"{catalog_raw}（本机应为 {expected_catalog}）",
+                    "若 Codex 读不到本机模型目录，运行 doctor --fix-path 改写",
+                )
         elif not catalog_path.exists():
             d.add("bad", "model_catalog_json 指向的文件不存在", catalog_raw)
         else:

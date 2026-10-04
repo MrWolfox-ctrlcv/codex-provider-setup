@@ -65,12 +65,22 @@ def err(m: str) -> None:
 
 
 def _pause() -> None:
-    """Keep the console window open on Windows so users can read messages."""
-    if sys.platform == "win32":
-        try:
-            _read("  按回车键退出...")
-        except (AbortError, OSError):
-            pass
+    """Keep the console window open on Windows so users can read messages.
+
+    Never blocks a scripted/CI run: with no interactive stdin there is nobody to
+    press Enter, so simply return.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        if not sys.stdin or not sys.stdin.isatty():
+            return
+    except (ValueError, OSError):
+        return
+    try:
+        _read("  按回车键退出...")
+    except (AbortError, OSError):
+        pass
 
 
 def _read(prompt: str = "") -> str:
@@ -705,6 +715,102 @@ def _post_install_hint(provider: Provider) -> None:
     dim("请完全退出 Codex（含托盘）后重新打开，并新建一个对话验证模型列表。")
 
 
+def manage_catalog() -> None:
+    """Clean garbage out of models.json without touching any channel.
+
+    Entries accumulate from channels that were never registered, channels
+    removed by hand, and models shared between channels (which per-channel
+    removal deliberately keeps).  None of those are reachable from the
+    per-channel menus, so this is the one place to deal with them.
+    """
+    while True:
+        head("清理模型目录（models.json）")
+        dim("  只动 models.json —— Codex 模型列表读的就是它。")
+        dim("  渠道配置（[model_providers.*]、Key、base_url）不会被修改。")
+        print("")
+
+        orphans = service.orphan_models()
+        shared = service.shared_models()
+        owners = service.catalog_ownership()
+        total = len(service.all_catalog_slugs())
+        owned = len([s for s in service.all_catalog_slugs() if s in owners])
+        print(f"  当前 models.json 共 {total} 条，其中 {owned} 条有渠道归属。")
+        if orphans:
+            warn(f"无渠道归属（孤儿）{len(orphans)} 条：{' / '.join(orphans)}")
+        else:
+            ok("没有无归属条目。")
+        if shared:
+            dim("  被多个渠道共用（按渠道删除时会保留）：")
+            for s, ids in sorted(shared.items()):
+                dim(f"    {s}  <- {' + '.join(ids)}")
+        print("")
+
+        print("    1) 一键精简：只保留各渠道实际拥有的模型（推荐）")
+        print("    2) 只删除无归属的孤儿条目")
+        print("    3) 手动勾选要删除的任意模型")
+        print("    4) 查看完整清单（含归属）")
+        print("    5) 返回")
+        opt = _read("  请输入 [1-5] ").strip()
+
+        if opt == "5":
+            return
+        if opt == "4":
+            print("")
+            for s in service.all_catalog_slugs():
+                who = owners.get(s)
+                mark = f"  <- {' + '.join(who)}" if who else "  <- (无归属)"
+                print(f"    {s:40}{mark}")
+            print("")
+            continue
+        if opt == "1":
+            try:
+                service.reset_catalog_to_channels(confirm=lambda: confirm("确认精简?", default=False))
+            except ValueError as exc:
+                err(str(exc))
+            continue
+        if opt == "2":
+            try:
+                service.prune_orphan_models(confirm=lambda: confirm("确认删除这些孤儿条目?", default=False))
+            except ValueError as exc:
+                err(str(exc))
+            continue
+        if opt == "3":
+            slugs = service.all_catalog_slugs()
+            if not slugs:
+                warn("models.json 里没有模型。")
+                continue
+            default_slug = service.current_state()[0]
+            print("  选择要删除的模型（当前默认模型已排除）：")
+            pool: list[str] = []
+            for s in slugs:
+                if s == default_slug:
+                    continue
+                who = owners.get(s)
+                tag = f"  <- {' + '.join(who)}" if who else "  <- (无归属)"
+                pool.append(s)
+                print(f"    {len(pool):3}) {s}{tag}")
+            if not pool:
+                warn("没有可删除的模型。")
+                continue
+            dim(f"    当前默认模型 {default_slug} 不能删除；如需删除请先切换默认模型。")
+            sel = read_choice_list(_read("  输入编号（逗号/空格/区间；a=全部；q=返回） "), len(pool))
+            if sel is None or not sel:
+                continue
+            chosen = [pool[i] for i in sel]
+            print("")
+            print(f"  将删除 {len(chosen)} 个条目：{' / '.join(chosen)}")
+            warn("若某个模型属于某渠道，从目录移除后该渠道仍会保留，只是模型不再出现在列表里。")
+            if not confirm("确认删除?", default=False):
+                dim("已取消。")
+                continue
+            try:
+                service.remove_catalog_models(chosen)
+            except ValueError as exc:
+                err(str(exc))
+            continue
+        warn("输入无效，请重新选择。")
+
+
 def run_doctor() -> None:
     """Diagnose why Codex may not show the newly installed provider/model."""
     head("诊断与修复")
@@ -729,6 +835,20 @@ def run_doctor() -> None:
         if not confirm("仍要继续修复?", default=False):
             dim("已取消。")
             return
+
+    mismatch = service.catalog_path_mismatch()
+    if mismatch is not None:
+        current, expected = mismatch
+        print("")
+        warn("model_catalog_json 指向的不是本机路径：")
+        print(f"      当前: {current}")
+        print(f"      应为: {expected}")
+        dim("  换机器 / 换用户名后会出现这种情况，Codex 会因此读不到模型列表。")
+        if confirm("现在改写为本机路径?", default=True):
+            try:
+                service.fix_catalog_path()
+            except ValueError as exc:
+                err(str(exc))
 
     if not ui_files and not web.exists():
         if diag.ok:
@@ -929,9 +1049,10 @@ def main_menu() -> None:
         print("    4) 回退（恢复运行前原状）")
         print("    5) 查看当前状态")
         print("    6) 诊断与修复（Codex 里不显示新模型 / provider 不对时用）")
-        print("    7) 退出")
-        choice = _read("  请输入 [1-7] ").strip()
-        if choice == "7":
+        print("    7) 清理模型目录（删除列表里的垃圾模型，不动渠道）")
+        print("    8) 退出")
+        choice = _read("  请输入 [1-8] ").strip()
+        if choice == "8":
             print("  再见。")
             return
 
@@ -1049,6 +1170,10 @@ def main_menu() -> None:
 
         if choice == "6":
             run_doctor()
+            continue
+
+        if choice == "7":
+            manage_catalog()
             continue
 
         bad_menu += 1

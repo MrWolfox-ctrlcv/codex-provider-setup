@@ -16,6 +16,7 @@ from codex_provider.io_utils import (
     read_json,
     read_text,
     sanitize_ctrl,
+    toml_quote,
 )
 from codex_provider.provider import Provider
 
@@ -462,6 +463,77 @@ def switch_default_model(slug: str) -> None:
     atomic_write(path, new_text, tmp_suffix=".switch-tmp")
 
 
+def catalog_path_mismatch() -> tuple[str, str] | None:
+    """Return (current_value, expected_value) when the catalog path is stale.
+
+    ``model_catalog_json`` records an absolute path, so copying a config to a
+    machine with a different home directory (or username) leaves Codex pointing
+    at a file that does not exist there -- the model list then comes up empty.
+    Returns None when the value is already correct or not set.
+    """
+    config_path = paths.config_path()
+    if not config_path.exists():
+        return None
+    source = read_text(config_path)
+    m = re.search(r'(?m)^\s*model_catalog_json\s*=\s*"([^"]*)"', source)
+    if not m:
+        return None
+    current = m.group(1)
+    expected = paths.catalog_value()
+    if current == expected:
+        return None
+    return current, expected
+
+
+def fix_catalog_path(*, echo: Echo = print) -> bool:
+    """Rewrite ``model_catalog_json`` to this machine's models.json path.
+
+    Only that single line changes: provider sections, credentials and every
+    other setting are left byte-for-byte as they were.  Useful after moving a
+    Codex setup to another machine or user account.
+    """
+    mismatch = catalog_path_mismatch()
+    if mismatch is None:
+        echo("[OK] model_catalog_json 已指向本机路径，无需修复。")
+        return False
+    current, expected = mismatch
+    config_path = paths.config_path()
+
+    echo("model_catalog_json 指向的路径不是本机路径：")
+    echo(f"  当前: {current}")
+    echo(f"  应为: {expected}")
+
+    source = read_text(config_path)
+    new_text = re.sub(
+        r'(?m)^(\s*model_catalog_json\s*=\s*)("[^"]*")',
+        lambda mm: mm.group(1) + toml_quote(expected),
+        source,
+        count=1,
+    )
+    try:
+        tomllib.loads(new_text)
+    except Exception as exc:
+        raise ValueError(f"改写后的 config.toml 未通过校验，已中止（原文件未改动）\n{exc}") from exc
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safety = paths.codex_home() / f"safety-{stamp}-catalog-path"
+    backup.snapshot_files(safety, [config_path], stamp=stamp)
+    atomic_write(config_path, new_text, tmp_suffix=".catalog-path-tmp")
+
+    if not paths.models_path().exists():
+        echo(f"[!]  注意：本机 {paths.models_path()} 尚不存在。")
+        echo("     请在该机器上重新运行 install 生成模型目录，否则 Codex 仍读不到模型。")
+    else:
+        data = read_json(paths.models_path())
+        if isinstance(data, dict) and isinstance(data.get("models"), list):
+            echo(f"[OK] 已改写为本机路径，模型目录内含 {len(data['models'])} 个条目。")
+        else:
+            echo("[!]  已改写路径，但本机 models.json 解析失败，建议重新 install。")
+    echo(f"[i]  改动前副本：{safety / 'config.toml'}")
+    echo("[i]  渠道配置（[model_providers.*]）与 Key 均未改动。")
+    return True
+
+
 def restore_impact(provider_id: str) -> list[str]:
     """Other channels a full snapshot restore would also roll back."""
     config_path = paths.config_path()
@@ -476,6 +548,197 @@ def restore_impact(provider_id: str) -> list[str]:
         if toml_edit.provider_section_body(source, pid):
             affected.append(pid)
     return affected
+
+
+# ---------------------------------------------------------------------------
+# Model-catalog housekeeping
+#
+# Channels ([model_providers.*]) are never touched here.  These helpers only
+# edit models.json, which is purely a display/registration catalog: entries can
+# accumulate for channels that were never registered (or were removed by hand),
+# and the per-channel removal path deliberately keeps models shared with another
+# channel.  Both leave "garbage" that no other command can reach.
+# ---------------------------------------------------------------------------
+
+
+def _load_catalog() -> list[dict]:
+    mpath = paths.models_path()
+    if not mpath.exists():
+        raise ValueError("models.json 不存在，无需清理。")
+    data = read_json(mpath)
+    if not (isinstance(data, dict) and isinstance(data.get("models"), list)):
+        raise ValueError(f"读取 {mpath} 失败，已中止（未改动任何文件）")
+    return data["models"]
+
+
+def catalog_ownership() -> dict[str, list[str]]:
+    """Map each model slug to the channels that claim it in the registry."""
+    owners: dict[str, list[str]] = {}
+    reg = registry.load(paths.registry_path())
+    providers = reg.get("providers") if reg and isinstance(reg.get("providers"), list) else []
+    for prov in providers:
+        if not isinstance(prov, dict):
+            continue
+        pid = prov.get("id")
+        if not pid:
+            continue
+        for slug in prov.get("models") or []:
+            if isinstance(slug, str) and slug:
+                owners.setdefault(slug, []).append(pid)
+    return owners
+
+
+def orphan_models() -> list[str]:
+    """Catalog entries no registered channel claims."""
+    data = read_json(paths.models_path())
+    if not (isinstance(data, dict) and isinstance(data.get("models"), list)):
+        return []
+    owners = catalog_ownership()
+    out: list[str] = []
+    for item in data["models"]:
+        if not isinstance(item, dict):
+            continue
+        slug = item.get("slug")
+        if not slug:
+            out.append("(无 slug 的条目)")
+        elif slug not in owners:
+            out.append(slug)
+    return out
+
+
+def shared_models() -> dict[str, list[str]]:
+    """Catalog entries claimed by more than one channel."""
+    return {s: ids for s, ids in catalog_ownership().items() if len(ids) > 1}
+
+
+def _default_model_slug() -> str:
+    return current_state()[0]
+
+
+def _write_catalog(keep: list[dict], *, tmp_suffix: str) -> None:
+    text = catalog.catalog_text(keep, True)
+    try:
+        json.loads(text)
+    except ValueError as exc:
+        raise ValueError("生成的 models.json 未通过校验，已中止（未改动任何文件）") from exc
+    atomic_write(paths.models_path(), text, tmp_suffix=tmp_suffix)
+
+
+def remove_catalog_models(slugs: list[str], *, echo: Echo = print) -> int:
+    """Delete the given model entries from models.json.
+
+    Only the catalog is edited: ``[model_providers.*]`` sections, their
+    credentials and the registry are all left exactly as they are.  The current
+    default model is protected, because config.toml points at it.
+    """
+    wanted = [s for s in dict.fromkeys(slugs or []) if s]
+    if not wanted:
+        echo("没有指定要删除的模型。")
+        return 0
+    models = _load_catalog()
+    default_slug = _default_model_slug()
+    if default_slug in wanted:
+        raise ValueError(
+            f'"{default_slug}" 是当前默认模型（config.toml 正在引用），不能移除。\n'
+            "    请先在主菜单「切换默认模型」改到其它模型。"
+        )
+
+    present = {m.get("slug") for m in models if isinstance(m, dict)}
+    targets = [s for s in wanted if s in present]
+    missing = [s for s in wanted if s not in present]
+    if missing:
+        echo(f"[i]  以下条目本就不在 models.json 中，已跳过：{' / '.join(missing)}")
+    if not targets:
+        echo("没有需要删除的条目。")
+        return 0
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safety = paths.codex_home() / f"safety-{stamp}-catalog"
+    backup.snapshot_files(safety, [paths.models_path()], stamp=stamp)
+    echo(f"[i] 改动前副本：{safety / 'models.json'}")
+
+    drop = set(targets)
+    keep = [m for m in models if not (isinstance(m, dict) and m.get("slug") in drop)]
+    _write_catalog(keep, tmp_suffix=".purge-tmp")
+    echo(f"[OK] 已从 models.json 移除 {len(targets)} 个条目：{' / '.join(targets)}")
+    echo("[i]  渠道配置（[model_providers.*]）与 registry 均未改动。")
+    return len(targets)
+
+
+def prune_orphan_models(*, echo: Echo = print, confirm: Callable[[], bool] | None = None) -> int:
+    """Delete catalog entries that no registered channel claims."""
+    orphans = orphan_models()
+    if not orphans:
+        echo("[OK] 没有无归属的目录条目，无需清理。")
+        return 0
+    echo(f"发现 {len(orphans)} 个无渠道归属的目录条目：")
+    for slug in orphans:
+        echo(f"  - {slug}")
+    echo("")
+    echo("这些条目没有任何渠道认领，Codex 模型列表里会显示但选不了。")
+    if confirm is not None and not confirm():
+        echo("[!] 已取消。")
+        return 0
+    return remove_catalog_models(orphans, echo=echo)
+
+
+def reset_catalog_to_channels(
+    *,
+    echo: Echo = print,
+    confirm: Callable[[], bool] | None = None,
+    dry_run: bool = False,
+) -> int:
+    """Rebuild models.json so it contains only models the channels claim.
+
+    Channels and their credentials are untouched; this only filters the catalog
+    down to entries owned by a registered channel.  The current default model is
+    always kept even if nothing claims it, or Codex would lose its model.
+    """
+    models = _load_catalog()
+    owners = catalog_ownership()
+    default_slug = _default_model_slug()
+
+    keep: list[dict] = []
+    dropped: list[str] = []
+    for item in models:
+        if not isinstance(item, dict):
+            dropped.append("(无 slug 的条目)")
+            continue
+        slug = item.get("slug")
+        if slug in owners or slug == default_slug:
+            keep.append(item)
+        else:
+            dropped.append(slug or "(无 slug 的条目)")
+
+    if not dropped:
+        echo("[OK] 目录已与渠道一致，无需清理。")
+        return 0
+
+    echo(f"将把 models.json 精简为「渠道实际拥有的模型」，共保留 {len(keep)} 条：")
+    for pid in sorted({p for ids in owners.values() for p in ids}):
+        mine = sorted(s for s, ids in owners.items() if pid in ids)
+        echo(f"  [{pid}] {' / '.join(mine)}")
+    if default_slug and default_slug not in owners:
+        echo(f"  (默认模型 {default_slug} 无渠道归属，已保留以免 Codex 失去当前模型)")
+    echo("")
+    echo(f"将移除 {len(dropped)} 个条目：")
+    for slug in dropped:
+        echo(f"  - {slug}")
+    echo("")
+    echo("[i]  渠道本身（含 Key、base_url）全部保留，只动 models.json。")
+    if dry_run:
+        return 0
+    if confirm is not None and not confirm():
+        echo("[!] 已取消。")
+        return 0
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safety = paths.codex_home() / f"safety-{stamp}-catalog-reset"
+    backup.snapshot_files(safety, [paths.models_path(), paths.registry_path()], stamp=stamp)
+    echo(f"[i] 改动前副本：{safety}")
+    _write_catalog(keep, tmp_suffix=".reset-tmp")
+    echo(f"[OK] 已移除 {len(dropped)} 个条目，保留 {len(keep)} 个。")
+    return len(dropped)
 
 
 def restore_provider(provider: Provider, *, echo: Echo = print, confirm: Callable[[], bool] | None = None) -> None:

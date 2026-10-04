@@ -487,7 +487,7 @@ def test_show_status_provider(monkeypatch, tmp_codex_home, capsys):
 def test_main_menu_exit(monkeypatch, tmp_codex_home):
     monkeypatch.setattr(interact, "_active", None)
     monkeypatch.setattr(interact.service, "current_state", lambda: ("(未设置)", "(未设置)"))
-    monkeypatch.setattr(builtins, "input", lambda _p="": "7")
+    monkeypatch.setattr(builtins, "input", lambda _p="": "8")
     interact.main_menu()
 
 
@@ -506,7 +506,7 @@ def test_main_menu_switch_model(monkeypatch, tmp_codex_home):
     monkeypatch.setattr(interact, "choose_provider", lambda allow_custom: prov)
     switched: list[str] = []
     monkeypatch.setattr(interact.service, "switch_default_model", lambda slug: switched.append(slug))
-    answers = iter(["3", "2", "7"])
+    answers = iter(["3", "2", "8"])
     monkeypatch.setattr(builtins, "input", lambda _p="": next(answers))
     interact.main_menu()
     assert switched == ["b"]
@@ -521,7 +521,7 @@ def test_main_menu_switch_by_slug(monkeypatch, tmp_codex_home):
     monkeypatch.setattr(interact.service, "all_catalog_slugs", lambda: ["reg-a", "reg-b"])
     switched: list[str] = []
     monkeypatch.setattr(interact.service, "switch_default_model", lambda slug: switched.append(slug))
-    answers = iter(["3", "reg-b", "7"])
+    answers = iter(["3", "reg-b", "8"])
     monkeypatch.setattr(builtins, "input", lambda _p="": next(answers))
     interact.main_menu()
     assert switched == ["reg-b"]
@@ -544,7 +544,7 @@ def test_main_menu_install_flow(monkeypatch, tmp_codex_home):
     # keep the flow deterministic regardless of whether Codex runs on this machine
     monkeypatch.setattr(interact.doctor, "find_codex_processes", lambda: [])
     monkeypatch.setattr(interact.doctor, "ui_state_files", lambda: [])
-    answers = iter(["1", "7"])
+    answers = iter(["1", "8"])
     monkeypatch.setattr(builtins, "input", lambda _p="": next(answers))
     interact.main_menu()
     assert len(installed) == 1
@@ -581,7 +581,7 @@ def test_main_menu_existing_channel_offers_key_update(monkeypatch, tmp_codex_hom
     monkeypatch.setattr(interact.service, "install_provider", lambda p, k: installed.append(p))
 
     # menu 1 -> existing channel -> option 1 (update key) -> back -> quit
-    answers = iter(["1", "1", "6", "7"])
+    answers = iter(["1", "1", "6", "8"])
     monkeypatch.setattr(builtins, "input", lambda _p="": next(answers))
     interact.main_menu()
 
@@ -602,7 +602,7 @@ def test_main_menu_install_warns_when_codex_running(monkeypatch, tmp_codex_home,
     called: list[str] = []
     monkeypatch.setattr(interact.service, "install_provider", lambda p, k: called.append("install"))
     # decline the "continue anyway?" prompt, then exit
-    answers = iter(["1", "n", "7"])
+    answers = iter(["1", "n", "8"])
     monkeypatch.setattr(builtins, "input", lambda _p="": next(answers))
     interact.main_menu()
     assert called == []

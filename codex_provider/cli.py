@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import traceback
@@ -60,10 +61,38 @@ def _build_parser() -> argparse.ArgumentParser:
     prune = sub.add_parser("prune", help="免交互：探测并移除当前 Key 不可用的模型")
     prune.add_argument("--provider-id", required=True)
 
+    purge = sub.add_parser(
+        "prune-models",
+        help="清理 models.json 里的垃圾条目（不动渠道配置）",
+    )
+    purge_mode = purge.add_mutually_exclusive_group()
+    purge_mode.add_argument(
+        "--all",
+        action="store_true",
+        help="只保留各渠道实际拥有的模型（推荐；渠道本身完全不动）",
+    )
+    purge_mode.add_argument(
+        "--orphans",
+        action="store_true",
+        help="只删除没有任何渠道归属的条目",
+    )
+    purge.add_argument(
+        "--drop",
+        help="额外删除指定模型（逗号分隔），可精确到具体条目",
+    )
+    purge.add_argument("--dry-run", action="store_true", help="只列出将删除的内容，不写盘")
+    purge.add_argument("--yes", action="store_true", help="跳过确认（脚本化使用）")
+
     sub.add_parser("selftest", help="运行内置自测")
 
     doc = sub.add_parser("doctor", help="诊断 Codex 为何不显示新接入的 provider/模型")
     doc.add_argument("--fix", action="store_true", help="清理桌面端 UI 状态缓存（备份后清除）")
+    doc.add_argument(
+        "--fix-path",
+        action="store_true",
+        help="把 model_catalog_json 改写为本机路径（换机器/换用户名后必用）",
+    )
+    doc.add_argument("--yes", action="store_true", help="配合 --fix-path：跳过确认")
     doc.add_argument("--include-web", action="store_true", help="连同桌面端 Chromium 数据目录一起清理")
     doc.add_argument("--json", action="store_true", help="以 JSON 输出诊断结果")
     doc.add_argument("--restore-ui", action="store_true", help="从最近的备份恢复桌面端 UI 状态")
@@ -278,10 +307,16 @@ def _log_crash(exc: BaseException) -> None:
 def _pause_before_exit() -> None:
     """Keep the console window open on Windows so users can read errors.
 
-    Must never raise: this runs while an error is already being reported, and a
-    failure here would hide the real message.
+    Must never raise or block: this runs while an error is already being
+    reported.  It also must not hang a scripted/CI invocation, which has no
+    interactive stdin -- hence the isatty() guard.
     """
     if sys.platform != "win32":
+        return
+    try:
+        if not sys.stdin or not sys.stdin.isatty():
+            return
+    except (ValueError, OSError):
         return
     try:
         import ctypes
@@ -359,6 +394,32 @@ def _cmd_doctor(args) -> int:
         if as_json:
             return
         {"ok": interact.ok, "warn": interact.warn, "err": interact.err}[kind](msg)
+
+    if getattr(args, "fix_path", False):
+        mismatch = service.catalog_path_mismatch()
+        if mismatch is None:
+            say("ok", "model_catalog_json 已指向本机路径，无需修复。")
+            if as_json:
+                print(json.dumps({"ok": True, "changed": False, "catalog_path_mismatch": None},
+                                 ensure_ascii=True, indent=2))
+            return 0
+        current, expected = mismatch
+        say("warn", "model_catalog_json 指向的不是本机路径：")
+        say("warn", f"  当前: {current}")
+        say("warn", f"  应为: {expected}")
+        say("warn", "换机器 / 换用户名后会出现这种情况，Codex 会因此读不到模型列表。")
+        if not getattr(args, "yes", False) and not interact.confirm("现在改写为本机路径?", default=True):
+            say("warn", "已取消，未改动任何文件。")
+            return 1
+        try:
+            service.fix_catalog_path()
+        except ValueError as exc:
+            interact.err(str(exc))
+            return 1
+        if as_json:
+            print(json.dumps({"ok": True, "changed": True,
+                              "from": current, "to": expected}, ensure_ascii=True, indent=2))
+        return 0
 
     diag = doctor.diagnose()
     payload: dict = {
@@ -462,6 +523,53 @@ def _cmd_doctor(args) -> int:
         }
         print(_json.dumps(payload, ensure_ascii=True, indent=2))
     return 0 if not result["errors"] else 1
+
+
+def _cmd_prune_models(args) -> int:
+    """Clean garbage out of models.json without touching any channel.
+
+    Channels ([model_providers.*]) keep their id, base_url and credential; this
+    only edits the catalog, which is what the Codex model picker reads.
+    """
+    drop_raw = getattr(args, "drop", None)
+    drop = [s.strip() for s in (drop_raw or "").replace("，", ",").split(",") if s.strip()]
+
+    if not args.all and not args.orphans and not drop:
+        raise SystemExit(
+            "请指定清理方式：--all（只保留渠道拥有的模型）/ --orphans（只删无归属条目）"
+            "/ --drop <模型,逗号分隔>。可加 --dry-run 先预览。"
+        )
+
+    if args.dry_run:
+        print("")
+        print("[dry-run] 只预览，不会写入任何文件。")
+        print("")
+        if args.all:
+            service.reset_catalog_to_channels(confirm=None, dry_run=True)
+        if args.orphans:
+            orphans = service.orphan_models()
+            if orphans:
+                print(f"无归属条目 {len(orphans)} 个：")
+                for s in orphans:
+                    print(f"  - {s}")
+            else:
+                print("[OK] 没有无归属条目。")
+        if drop:
+            print(f"指定删除 {len(drop)} 个：{' / '.join(drop)}")
+        print("")
+        return 0
+
+    confirm = None if getattr(args, "yes", False) else (lambda: interact.confirm("确认执行清理?", default=False))
+    removed = 0
+    if args.all:
+        removed += service.reset_catalog_to_channels(confirm=confirm)
+    if args.orphans:
+        removed += service.prune_orphan_models(confirm=confirm)
+    if drop:
+        removed += service.remove_catalog_models(drop)
+    if removed:
+        interact.ok(f"共移除 {removed} 个目录条目；渠道配置未改动。")
+    return 0
 
 
 def _cmd_selftest() -> int:
@@ -568,6 +676,8 @@ def _main(argv: list[str] | None = None) -> int:
         return _cmd_provider_op(args, lambda prov, key: service.sync_from_upstream(prov, key))
     if args.command == "prune":
         return _cmd_provider_op(args, lambda prov, key: service.prune_unusable(prov, key))
+    if args.command == "prune-models":
+        return _cmd_prune_models(args)
     if args.command == "selftest":
         return _cmd_selftest()
     if args.command == "doctor":
