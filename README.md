@@ -5,8 +5,8 @@
 以官方 DeepSeek 接入脚本的成熟做法为蓝本，将其泛化：任意 OpenAI 兼容 / Responses API
 兼容的模型提供方，均可通过交互菜单或一条命令行完成接入、切换、维护与回退。
 
-> **v0.2.0** — 本版新增**渠道生命周期**管理：可更换 API Key（写入前探活）、可只删除某一个
-> 渠道而不影响其它、换 Key 后自动重新同步模型清单。另修复 10 项交互与数据安全问题。
+> **v0.2.1** — 新增 `doctor --fix-path`（修复**换机器/换用户名**后 `model_catalog_json`
+> 断链导致的"模型列表为空"）与 `prune-models`（清理 models.json 垃圾，不动渠道）。
 > 详见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 特性
@@ -109,7 +109,9 @@ codex-provider-setup restore --provider-id <id>  # 回退到该 provider 接入�
 codex-provider-setup sync --provider-id <id>     # 免交互：把上游 /models 新模型并入已接入的 provider
 codex-provider-setup prune --provider-id <id>    # 免交互：探测并移除当前 Key 不可用的模型
 codex-provider-setup doctor                      # 诊断：Codex 里不显示新模型 / provider 不对
+codex-provider-setup doctor --fix-path           # 换机器后修复 model_catalog_json 断链
 codex-provider-setup doctor --fix                # 诊断并清理桌面端 UI 状态缓存（备份后清除）
+codex-provider-setup prune-models --all          # 清理模型列表垃圾（不动渠道配置）
 ```
 
 ## 换 API Key / 删除渠道
@@ -144,6 +146,39 @@ codex-provider-setup remove --provider-id deepseek --yes
 
 所有破坏性操作（换 Key / 删渠道 / 切模型 / 影响其它渠道的 restore）都会先在
 `~/.codex/safety-<时间戳>-<操作>/` 留一份可还原的副本。
+
+## 换机器 / 发给别人用
+
+`model_catalog_json` 记录的是**绝对路径**。把 `~/.codex` 里的配置直接拷到另一台机器
+（或同一台机器的另一个用户名下）后，它会指向一个不存在的文件，**Codex 的模型列表会变空 /
+模型无法使用**。这种情况下：
+
+```powershell
+codex-provider-setup doctor              # 会报 [X] 路径不存在
+codex-provider-setup doctor --fix-path   # 改写为本机路径（只改这一行）
+```
+
+`--fix-path` 只改 `model_catalog_json` 一行，渠道配置、API Key 与其它设置逐字节保留，
+改写前会留安全快照。若目标机器上还没有 `models.json`，请先在该机器上跑一次 `install`。
+
+> 注意：**API Key 不会跟着配置走**——它要么在 `config.toml` 的
+> `experimental_bearer_token` 里（随文件一起复制），要么在环境变量里（需要在目标机器上
+> 重新设置）。若用 `env_key` 方式，目标机器上要重设环境变量并**重开终端**。
+
+## 清理模型列表里的垃圾
+
+模型列表（`models.json`）会积累一些**无法通过菜单删除**的条目：来自未登记渠道的、
+以及被多个渠道共用的。清理只动 `models.json`，**渠道本身完全不受影响**：
+
+```powershell
+codex-provider-setup prune-models --all --dry-run   # 先预览
+codex-provider-setup prune-models --all             # 只保留各渠道实际拥有的模型
+codex-provider-setup prune-models --orphans         # 只删无渠道归属的条目
+codex-provider-setup prune-models --drop a,b        # 精确删除指定模型
+```
+
+交互菜单里是 **7) 清理模型目录**：一键精简 / 只删孤儿 / 手动勾选任意模型 / 查看归属清单。
+当前默认模型受保护，不会被删除。
 
 ## 接入后 Codex 里看不到新模型？
 

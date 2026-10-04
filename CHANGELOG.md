@@ -2,6 +2,35 @@
 
 本文件记录本工具的显著变更。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.1] - 2026-10-04
+
+本版解决**迁移**与**模型目录垃圾**两个问题。
+
+### 新增
+
+- **`doctor --fix-path`：修复换机器/换用户名后的断链路径**。
+  `model_catalog_json` 记录的是绝对路径，把配置复制到 home 目录或用户名不同的
+  机器上后，Codex 会指向一个不存在的文件，导致**模型列表为空 / 无法使用**。
+  现在 `doctor` 会把这种情况报为**失败**（此前若旧路径恰好存在会误报通过），
+  `doctor --fix-path` 可把该行改写为本机路径；只改这一行，渠道、Key 与其它设置
+  逐字节保留，改写前留安全快照。交互式「诊断与修复」也会发现并询问。
+- **`prune-models`：清理 models.json 里的垃圾条目**（不动渠道配置）。
+  支持 `--all`（只保留各渠道实际拥有的模型）、`--orphans`（只删无归属条目）、
+  `--drop <模型,...>`（精确指定）、`--dry-run`（只预览）、`--yes`（跳过确认）。
+  另有交互菜单 **7) 清理模型目录**：一键精简 / 只删孤儿 / 手动勾选任意模型 / 查看归属清单。
+  仅编辑 `models.json`，`[model_providers.*]`、凭据与 registry 均不改动；
+  **当前默认模型受保护**，不会被删除。
+  这些条目此前**无法通过任何菜单或命令删除**：无渠道归属的孤儿条目，
+  以及被多个渠道共用的条目（按渠道删除时会保护性保留）都触及不到。
+
+### 修复
+
+- Windows 上 `_pause()` / `_pause_before_exit()` 会无条件调用 `input()`，
+  在脚本或 CI 等非交互环境下**永久阻塞等待按键**。现在检测到 stdin 不是终端就直接返回。
+- 非 UTF-8 控制台（cp1252 / GBK）下打印中文会抛 `UnicodeEncodeError` 而崩溃，
+  且崩溃发生在错误处理内部，用户只能看到 traceback 而非错误信息。现在输出统一
+  以 UTF-8 写入并对无法表示的字符降级处理。
+
 ## [0.2.0] - 2026-10-04
 
 本版聚焦**渠道生命周期**：渠道 = 一个 `[model_providers.<id>]` 段及其模型清单，
@@ -62,4 +91,5 @@
 - CI 不再"只构建不验证"：wheel 会装进干净 venv 并运行其控制台脚本，exe 会做冒烟测试，
   测试阶段也会运行内置 `selftest`。
 
+[0.2.1]: https://github.com/MrWolfox-ctrlcv/codex-provider-setup/releases/tag/v0.2.1
 [0.2.0]: https://github.com/MrWolfox-ctrlcv/codex-provider-setup/releases/tag/v0.2.0
