@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Callable
 
 from codex_provider import backup, catalog, env_os, paths, registry, toml_edit, upstream
-from codex_provider.io_utils import atomic_write, read_json, read_text, sanitize_ctrl
+from codex_provider.io_utils import (
+    atomic_write,
+    is_legal_model_slug,
+    read_json,
+    read_text,
+    sanitize_ctrl,
+)
 from codex_provider.provider import Provider
 
 SCRIPT_VERSION = "1.1.0"
@@ -143,14 +149,153 @@ def get_api_key(provider: Provider, param_key: str = "", interactive_prompt: Cal
             return v.strip()
     if not provider.use_env_key and paths.config_path().exists():
         text = read_text(paths.config_path())
-        m = re.search(rf'(?m)^\[\s*model_providers\.{re.escape(provider.id)}\s*\](?P<body>.*?)(?=^\[\s*|\Z)', text, re.S)
-        if m:
-            tk = re.search(r'(?m)^experimental_bearer_token\s*=\s*"([^"]*)"', m.group("body"))
+        body = toml_edit.provider_section_body(text, provider.id)
+        if body:
+            tk = re.search(r'(?m)^experimental_bearer_token\s*=\s*"([^"]*)"', body)
             if tk:
                 return tk.group(1)
     if interactive_prompt is None:
         return None
     return interactive_prompt()
+
+
+def stored_api_key(provider_id: str) -> str | None:
+    """The bearer token currently persisted for ``provider_id``, if any."""
+    path = paths.config_path()
+    if not path.exists():
+        return None
+    body = toml_edit.provider_section_body(read_text(path), provider_id)
+    if not body:
+        return None
+    tk = re.search(r'(?m)^experimental_bearer_token\s*=\s*"([^"]*)"', body)
+    return tk.group(1) if tk else None
+
+
+def prompt_new_api_key(provider: Provider, prompt: Callable[[], str]) -> str | None:
+    """Always ask for a key, ignoring whatever is already stored.
+
+    ``get_api_key`` intentionally prefers an existing credential so that
+    re-installs stay non-interactive; that made it impossible to replace a
+    revoked key.  Key rotation must bypass it entirely.
+    """
+    return prompt()
+
+
+def update_api_key(provider: Provider, new_key: str, *, echo: Echo = print) -> None:
+    """Replace a channel's credential in place, leaving everything else alone.
+
+    Only the credential is touched: other providers, the user's own config
+    sections and the model catalog are all preserved.
+    """
+    config_path = paths.config_path()
+    if not config_path.exists():
+        raise ValueError(f"找不到 {config_path}，无法更新 Key。")
+    source = read_text(config_path)
+    body = toml_edit.provider_section_body(source, provider.id)
+    if not body:
+        raise ValueError(f"config.toml 里没有 [model_providers.{provider.id}]，无法更新 Key。")
+
+    new_key = sanitize_ctrl(new_key).strip()
+    if not new_key:
+        raise ValueError("新 Key 为空，未做任何修改。")
+
+    if provider.use_env_key and provider.env_var_name:
+        env_os.persist_env(provider.env_var_name, new_key)
+        echo(f"[OK] 已更新环境变量 {provider.env_var_name}（新开终端生效）")
+        echo("[i]  该渠道使用 env_key，config.toml 中不保存 Key，无需改写。")
+        return
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup.snapshot_files(
+        paths.codex_home() / f"safety-{stamp}-key",
+        [config_path],
+        stamp=stamp,
+    )
+
+    new_text = toml_edit.set_bearer_token(source, provider.id, new_key)
+    try:
+        tomllib.loads(new_text)
+    except Exception as exc:
+        raise ValueError(f"改写后的 config.toml 未通过校验，已中止（原文件未改动）\n{exc}") from exc
+    atomic_write(config_path, new_text, tmp_suffix=f".{provider.id}-key-tmp")
+    echo("[OK] 已更新 config.toml 中的 experimental_bearer_token")
+    echo(f"[i]  改动前副本：{paths.codex_home() / f'safety-{stamp}-key' / 'config.toml'}")
+
+
+def remove_channel(provider_id: str, *, echo: Echo = print, confirm: Callable[[], bool] | None = None) -> None:
+    """Remove exactly one channel and everything this tool registered for it.
+
+    Unlike ``restore_provider`` (which rolls the whole config back to a
+    pre-install snapshot and therefore also reverts unrelated providers and any
+    later hand edits), this touches only the named channel.  The models it owns
+    are dropped from the catalog, but models still referenced by another
+    provider are kept.
+    """
+    config_path = paths.config_path()
+    if not config_path.exists():
+        raise ValueError(f"找不到 {config_path}，没有可删除的渠道。")
+    source = read_text(config_path)
+    if not toml_edit.provider_section_body(source, provider_id):
+        raise ValueError(f"config.toml 里没有 [model_providers.{provider_id}]，无需删除。")
+
+    rec = next((r for r in installed_providers() if r.get("id") == provider_id), None)
+    own_models = list((rec or {}).get("models") or [])
+
+    others_use: set[str] = set()
+    for pr in installed_providers():
+        if pr.get("id") != provider_id:
+            others_use.update(pr.get("models") or [])
+    removable = [s for s in own_models if s not in others_use]
+
+    st_model, st_prov = current_state()
+    is_default = st_prov == provider_id
+
+    echo(f"将删除渠道 {provider_id}：")
+    echo(f"  - 从 config.toml 移除 [model_providers.{provider_id}]")
+    echo(f"  - 从 models.json 移除其独占模型 {len(removable)} 个"
+         + (f"：{' / '.join(removable)}" if removable else "（无）"))
+    if own_models and len(removable) < len(own_models):
+        echo(f"  - 保留 {len(own_models) - len(removable)} 个被其它渠道共用的模型")
+    echo(f"  - 从 providers-registry.json 移除该条目")
+    if is_default:
+        echo("  [!] 该渠道当前是默认 provider，删除后将回退到配置里的其它设置")
+    if confirm is not None and not confirm():
+        echo("[!] 已取消。")
+        return
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safety = paths.codex_home() / f"safety-{stamp}-remove-{provider_id}"
+    backup.snapshot_files(safety, [config_path, paths.models_path(), paths.registry_path()], stamp=stamp)
+    echo(f"[i] 改动前副本：{safety}")
+
+    new_text, removed = toml_edit.remove_provider_section(source, provider_id)
+    if not removed:
+        raise ValueError(f"未能定位 [model_providers.{provider_id}]，已中止（原文件未改动）。")
+    try:
+        tomllib.loads(new_text)
+    except Exception as exc:
+        raise ValueError(f"移除后的 config.toml 未通过校验，已中止（原文件未改动）\n{exc}") from exc
+    atomic_write(config_path, new_text, tmp_suffix=f".{provider_id}-rm-tmp")
+
+    if removable and paths.models_path().exists():
+        data = read_json(paths.models_path())
+        if isinstance(data, dict) and isinstance(data.get("models"), list):
+            keep = [m for m in data["models"] if m.get("slug") not in set(removable)]
+            atomic_write(paths.models_path(), catalog.catalog_text(keep, True), tmp_suffix=".rm-tmp")
+
+    reg = registry.load(paths.registry_path())
+    if reg and isinstance(reg.get("providers"), list):
+        kept = [p for p in reg["providers"] if p.get("id") != provider_id]
+        if len(kept) != len(reg["providers"]):
+            registry.dump(paths.registry_path(), kept)
+
+    echo("[OK] 已删除该渠道（其它渠道与你的其它配置均未改动）。")
+
+
+def merge_stale_models(provider: Provider, current: list[str], upstream_models: list[str]) -> list[str]:
+    """Models this channel has registered but upstream no longer offers."""
+    up = set(upstream_models)
+    return [s for s in current if s not in up]
 
 
 def _registry_entry(provider: Provider, models: list[str] | None = None) -> dict:
@@ -175,10 +320,15 @@ def install_provider(
     provider: Provider,
     api_key: str,
     *,
-    reasoning_effort: str = "high",
+    reasoning_effort: str | None = None,
     in_selftest: bool = False,
     echo: Echo = print,
 ) -> None:
+    # An explicit argument wins; otherwise honour the value collected by the
+    # wizard/CLI on the provider itself. Previously this defaulted to "high"
+    # unconditionally, silently discarding the user's answer.
+    if reasoning_effort is None:
+        reasoning_effort = provider.reasoning_effort or "high"
     if not paths.codex_home().exists():
         raise SystemExit(
             f"未找到 Codex 配置目录: {paths.codex_home()}\n"
@@ -293,25 +443,73 @@ def install_provider(
 
 
 def switch_default_model(slug: str) -> None:
+    slug = (slug or "").strip()
+    if not is_legal_model_slug(slug):
+        raise ValueError(f"模型名不合法：{slug!r}（不能含引号或空白字符）")
     path = paths.config_path()
     source = read_text(path) if path.exists() else ""
-    atomic_write(path, toml_edit.switch_model(source, slug))
+    new_text = toml_edit.switch_model(source, slug)
+    try:
+        tomllib.loads(new_text)
+    except Exception as exc:
+        raise ValueError(f"改写后的 config.toml 未通过校验，已中止（原文件未改动）\n{exc}") from exc
+    if path.exists():
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup.snapshot_files(
+            paths.codex_home() / f"safety-{stamp}-switch",
+            [path],
+            stamp=stamp,
+        )
+    atomic_write(path, new_text, tmp_suffix=".switch-tmp")
+
+
+def restore_impact(provider_id: str) -> list[str]:
+    """Other channels a full snapshot restore would also roll back."""
+    config_path = paths.config_path()
+    if not config_path.exists():
+        return []
+    source = read_text(config_path)
+    affected: list[str] = []
+    for rec in installed_providers():
+        pid = rec.get("id")
+        if not pid or pid == provider_id:
+            continue
+        if toml_edit.provider_section_body(source, pid):
+            affected.append(pid)
+    return affected
 
 
 def restore_provider(provider: Provider, *, echo: Echo = print, confirm: Callable[[], bool] | None = None) -> None:
     backup_dir = paths.backup_dir(provider.id)
     if not backup_dir.exists():
         echo(f"[!] 未找到备份目录 {backup_dir}，没有可回退的内容。")
+        echo("    如需只移除该渠道，请改用「删除渠道」。")
         return
     has_bak_config = (backup_dir / "config.toml").exists()
     has_bak_models = (backup_dir / "models.json").exists()
+    others = restore_impact(provider.id)
     echo(f"回退到运行本脚本前的状态（provider: {provider.id}）")
     echo(f"  - {'恢复 config.toml' if has_bak_config else '删除 config.toml'}")
     echo(f"  - {'恢复 models.json' if has_bak_models else '删除 models.json'}")
     echo("  - 删除备份目录")
+    if others:
+        echo("")
+        echo("[!]  注意：该快照早于其它渠道的接入，本次回退会一并影响：")
+        echo(f"     {' / '.join(others)}")
+        echo("     以及安装之后你对 config.toml 的任何手改。")
+        echo("     若只想移除这一个渠道，请改用「删除渠道」（不动其它渠道）。")
     if confirm is not None and not confirm():
         echo("[!] 已取消。")
         return
+    if others:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safety = paths.codex_home() / f"safety-{stamp}-restore-{provider.id}"
+        backup.snapshot_files(
+            safety,
+            [paths.config_path(), paths.models_path(), paths.registry_path()],
+            stamp=stamp,
+        )
+        echo(f"[i] 回退前副本：{safety}")
     backup.restore(
         backup_dir,
         paths.config_path(),
@@ -471,7 +669,7 @@ def prune_unusable(provider: Provider, api_key: str, *, echo: Echo = print) -> N
     cur = _uniq(provider.models)
     if not cur:
         raise ValueError(f"provider '{provider.id}' 没有已注册模型，无需清理。")
-    echo(f"开始探测 {len(cur)} 个模型（每个最多 20 秒）...")
+    echo(f"开始探测 {len(cur)} 个模型（每个最多 20 秒，端点按 wire_api={provider.wire_api}）...")
     usable, unusable, unknown = upstream.probe_models(
         cur,
         provider.base_url,
@@ -479,6 +677,7 @@ def prune_unusable(provider: Provider, api_key: str, *, echo: Echo = print) -> N
         on_result=lambda slug, ok, cat, detail: echo(
             f"  探测 {slug}: {'可用' if ok else ('[X] 不可用' if cat == 'unusable' else '[?] 不确定')}（{detail}）"
         ),
+        wire_api=provider.wire_api,
     )
     echo(f"  可用   : {' / '.join(usable) if usable else '(无)'}")
     if unusable:

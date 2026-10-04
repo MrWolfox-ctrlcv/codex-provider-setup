@@ -23,6 +23,17 @@ UI_STATE_SUFFIX = ".codex-global-state.json"
 
 CODEX_PROCESS_HINTS = ("codex", "chatgpt")
 
+# Small state-bearing entries inside the Electron user-data dir.  Everything
+# else there (Cache, GPUCache, Code Cache, ...) is regenerated automatically and
+# is far too large to relocate into a backup folder.
+WEB_STATE_NAMES = (
+    "Local Storage",
+    "Session Storage",
+    "Preferences",
+    "Local State",
+    "Network Persistent State",
+)
+
 
 @dataclass
 class Finding:
@@ -108,6 +119,27 @@ def find_codex_processes() -> list[str]:
             if name not in seen:
                 seen.append(name)
     return seen
+
+
+def process_check_available() -> bool:
+    """Whether the process probe actually ran.
+
+    ``find_codex_processes`` returns an empty list both when nothing is running
+    and when the probe could not run at all (missing tasklist/ps).  Callers that
+    move live state files must tell those apart.
+    """
+    try:
+        if sys.platform == "win32":
+            proc = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=15
+            )
+        else:
+            proc = subprocess.run(
+                ["ps", "-A", "-o", "comm="], capture_output=True, text=True, timeout=15
+            )
+        return proc.returncode == 0
+    except Exception:
+        return False
 
 
 def _parse_config() -> tuple[dict | None, str | None]:
@@ -331,7 +363,10 @@ def reset_ui_state(*, include_web: bool = False, stamp: str | None = None) -> di
     """Move cached desktop UI state aside so Codex re-derives model list/provider.
 
     Everything is renamed into a backup folder (never deleted), so the operation
-    is reversible.
+    is reversible.  For the Chromium user-data directory only the small state
+    databases are moved: relocating the whole profile used to drag tens of
+    gigabytes of Cache/GPUCache into the backup folder, and ``--restore-ui``
+    could not put it back.
     """
     home = paths.codex_home()
     ts = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -339,13 +374,20 @@ def reset_ui_state(*, include_web: bool = False, stamp: str | None = None) -> di
     moved: list[str] = []
     errors: list[str] = []
 
-    targets = ui_state_files()
-    if include_web:
-        web = desktop_web_dir()
-        if web.exists():
-            targets.append(web)
+    targets = [p for p in ui_state_files() if p.is_file()]
+    web_state_files: list[Path] = []
+    web = desktop_web_dir()
+    if include_web and web.exists():
+        for name in WEB_STATE_NAMES:
+            candidate = web / name
+            if candidate.exists():
+                web_state_files.append(candidate)
+        for pattern in ("Local Storage", "Session Storage"):
+            sub = web / pattern
+            if sub.is_dir():
+                web_state_files.append(sub)
 
-    if not targets:
+    if not targets and not web_state_files:
         return {"backup_dir": None, "moved": [], "errors": []}
 
     try:
@@ -353,8 +395,19 @@ def reset_ui_state(*, include_web: bool = False, stamp: str | None = None) -> di
     except Exception as exc:  # noqa: BLE001
         return {"backup_dir": None, "moved": [], "errors": [f"无法创建备份目录: {exc}"]}
 
-    for path in targets:
-        dest = backup_dir / path.name
+    for path in targets + web_state_files:
+        # Keep the web files in a subfolder so a restore can tell them apart.
+        try:
+            is_web = web in path.parents or path.parent == web
+        except (TypeError, ValueError):
+            is_web = False
+        dest_dir = (backup_dir / "web") if is_web else backup_dir
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{path.name}: {exc}")
+            continue
+        dest = dest_dir / path.name
         try:
             if path.is_dir():
                 if dest.exists():

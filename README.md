@@ -8,8 +8,12 @@
 ## 特性
 
 - **最小侵入、手术式改写**：只改写 `config.toml` 顶部必要的 model / model_provider /
-  auth 相关字段并新增 `[model_providers.<id>]` 段；你原有的 MCP、desktop、projects、
+  auth 相关字段并新增 `[model_providers.<id>]` 段；你的 MCP、desktop、projects、
   skills、sandbox 等配置全部保留。
+  例外（有意为之，都会在输出中逐条列出并留备份）：会移除 `[profiles]` / `profile` /
+  `oss_provider` / `openai_base_url`，以及 `model_context_window`、`service_tier`、
+  `base_instructions` 等会覆盖模型目录元数据的陈旧字段——它们会让 Codex 读不到新渠道的
+  上下文窗口等参数。受影响的条目会打印成改动清单，可对照 `backup-<id>/manifest.txt` 查阅。
 - **合并式 models.json**：已存在的模型原样保留，只追加本 provider 缺失的模型；文件不
   存在时自动创建，不覆盖不清空。
 - **providers-registry 持久化**：每次接入/修改写回 `providers-registry.json`，模型级参
@@ -95,12 +99,47 @@ codex-provider-setup install `
 ```powershell
 codex-provider-setup switch <model>              # 切换默认模型
 codex-provider-setup status                      # 查看当前状态
-codex-provider-setup restore --provider-id <id>  # 回退到该 provider 接入前的状态
+codex-provider-setup update-key --provider-id <id>   # 换 Key（写入前先探活）
+codex-provider-setup remove --provider-id <id>       # 删除某一个渠道（不影响其它渠道）
+codex-provider-setup restore --provider-id <id>  # 回退到该 provider 接入前的整体快照
 codex-provider-setup sync --provider-id <id>     # 免交互：把上游 /models 新模型并入已接入的 provider
 codex-provider-setup prune --provider-id <id>    # 免交互：探测并移除当前 Key 不可用的模型
 codex-provider-setup doctor                      # 诊断：Codex 里不显示新模型 / provider 不对
 codex-provider-setup doctor --fix                # 诊断并清理桌面端 UI 状态缓存（备份后清除）
 ```
+
+## 换 API Key / 删除渠道
+
+渠道 = 一个 `[model_providers.<id>]` 段及其模型清单。日常维护都按**单个渠道**进行，
+不会波及其它渠道：
+
+```powershell
+# 换 Key：写入前先探活；失败则不写（可用 --force 强制，--no-sync 跳过模型同步）
+codex-provider-setup update-key --provider-id deepseek --api-key sk-xxxx
+
+# 只删这一个渠道：移除该段、其独占模型、registry 条目
+codex-provider-setup remove --provider-id deepseek --yes
+```
+
+交互菜单里选「1) 接入/更新 provider」再选一个**已接入**的渠道，会进入渠道子菜单：
+
+```
+1) 更新 API Key（换 Key 后自动重新同步模型）
+2) 重新接入 / 更新模型清单（保留现有 Key）
+3) 管理模型列表
+4) 删除此渠道（只删这一个，不影响其它渠道）
+5) 回退到运行脚本前的整体快照
+```
+
+换 Key 后会自动重新拉取 `/models` 并与本地清单比对：新 Key **看不到**的模型会列出来
+并询问是否移除——否则它们会继续留在 Codex 的模型列表里，能选但用不了。
+
+> **`restore` 与 `remove` 的区别**：`restore` 恢复的是**接入前的整体快照**，因此会一并
+> 回退之后接入的其它渠道、以及你安装后对 `config.toml` 的任何手改。检测到会影响其它渠道时
+> 会明确警告并列出受影响的渠道。只想移除一个渠道请用 `remove`。
+
+所有破坏性操作（换 Key / 删渠道 / 切模型 / 影响其它渠道的 restore）都会先在
+`~/.codex/safety-<时间戳>-<操作>/` 留一份可还原的副本。
 
 ## 接入后 Codex 里看不到新模型？
 

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import sys
 from pathlib import Path
 
 from codex_provider.io_utils import read_text, write_text
 
 _RC_NAMES = [".zshrc", ".bashrc", ".bash_profile", ".profile"]
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _rc_candidates(home: Path, shell: str | None = None) -> list[Path]:
@@ -21,12 +24,41 @@ def _rc_candidates(home: Path, shell: str | None = None) -> list[Path]:
 
 
 def _escape_value(value: str) -> str:
+    """Escape a value for a double-quoted POSIX shell assignment.
+
+    Newlines are escaped too: a raw newline would split the ``export`` across
+    two lines and leave a syntax error (or a stray command) in every new shell.
+    """
     return (
         value.replace("\\", "\\\\")
         .replace('"', '\\"')
         .replace("$", "\\$")
         .replace("`", "\\`")
+        .replace("\r", "")
+        .replace("\n", "\\n")
     )
+
+
+def _is_real_export(line: str, prefix: str) -> bool:
+    """Match an active ``export NAME=`` assignment, ignoring comments."""
+    stripped = line.lstrip()
+    if stripped.startswith("#"):
+        return False
+    return stripped.startswith(prefix)
+
+
+def _backup_once(path: Path) -> Path | None:
+    """Keep one recoverable copy of an rc file before the first modification."""
+    if not path.exists():
+        return None
+    bak = path.with_name(path.name + ".codex-provider-setup.bak")
+    if bak.exists():
+        return bak
+    try:
+        shutil.copy2(path, bak)
+        return bak
+    except OSError:
+        return None
 
 
 def _upsert_export(path: Path, name: str, value: str) -> None:
@@ -40,13 +72,14 @@ def _upsert_export(path: Path, name: str, value: str) -> None:
     replaced = False
     out: list[str] = []
     for line in lines:
-        if line.startswith(prefix):
+        if _is_real_export(line, prefix):
             out.append(newline)
             replaced = True
         else:
             out.append(line)
     if not replaced:
         out.append(newline)
+    _backup_once(path)
     write_text(path, "\n".join(out) + "\n")
 
 
@@ -61,14 +94,29 @@ def _remove_export(path: Path, name: str) -> None:
     if has_nl:
         lines.pop()
     prefix = f"export {name}="
-    out = [line for line in lines if not line.startswith(prefix)]
+    out = [line for line in lines if not _is_real_export(line, prefix)]
     if len(out) == len(lines):
         return
+    _backup_once(path)
     write_text(path, "\n".join(out) + "\n" if out else "")
 
 
 def _default_rc_files(home: Path | None) -> list[Path]:
     return _rc_candidates(home if home is not None else Path.home(), os.environ.get("SHELL"))
+
+
+def _write_targets(rc_files: list[Path]) -> list[Path]:
+    """Only touch rc files that already exist.
+
+    Writing the same secret into all four candidates created it in shells the
+    user never configured; a file that does not exist is left alone.
+    """
+    existing = [p for p in rc_files if p.exists()]
+    if existing:
+        return existing
+    # Nothing exists yet (fresh account): fall back to the first candidate so
+    # the key still becomes available in the user's shell.
+    return rc_files[:1]
 
 
 def persist_env(
@@ -79,6 +127,8 @@ def persist_env(
     rc_files: list[Path] | None = None,
     home: Path | None = None,
 ) -> None:
+    if not _ENV_NAME_RE.fullmatch(name or ""):
+        raise ValueError(f"环境变量名不合法：{name!r}")
     plat = platform if platform is not None else sys.platform
     if plat.startswith("win"):
         import winreg
@@ -90,7 +140,7 @@ def persist_env(
         return
     if rc_files is None:
         rc_files = _default_rc_files(home)
-    for path in rc_files:
+    for path in _write_targets(rc_files):
         _upsert_export(path, name, value)
 
 
@@ -101,6 +151,8 @@ def remove_env(
     rc_files: list[Path] | None = None,
     home: Path | None = None,
 ) -> None:
+    if not _ENV_NAME_RE.fullmatch(name or ""):
+        return
     plat = platform if platform is not None else sys.platform
     if plat.startswith("win"):
         import winreg

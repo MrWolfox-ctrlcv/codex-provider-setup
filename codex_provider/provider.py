@@ -27,6 +27,7 @@ class Provider:
     vision_by_model: dict[str, bool] = field(default_factory=dict)
     disable_web_search: bool = False
     meta_overrides: dict[str, dict] = field(default_factory=dict)
+    reasoning_effort: str = "high"
 
     def clone(self, models: list[str] | None = None) -> "Provider":
         from dataclasses import replace

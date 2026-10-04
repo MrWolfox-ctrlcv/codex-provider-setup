@@ -142,15 +142,23 @@ def test_reset_ui_state_noop_when_nothing_to_clean(tmp_codex_home):
 
 
 def test_reset_ui_state_can_include_web_dir(tmp_codex_home, monkeypatch, tmp_path):
+    """Only small state entries move; regenerable caches stay in place.
+
+    Relocating the whole Chromium profile used to drag gigabytes of Cache into
+    the backup folder and could not be restored.
+    """
     state = tmp_codex_home / ".codex-global-state.json"
     state.write_text("{}", encoding="utf-8")
     web = tmp_path / "Codex" / "web"
+    (web / "Local Storage").mkdir(parents=True)
+    (web / "Local Storage" / "leveldb").write_bytes(b"x")
     (web / "Cache").mkdir(parents=True)
-    (web / "Cache" / "x.bin").write_bytes(b"x")
+    (web / "Cache" / "big.bin").write_bytes(b"x" * 1024)
     monkeypatch.setattr(doctor, "desktop_web_dir", lambda: web)
     result = doctor.reset_ui_state(include_web=True, stamp="with-web")
-    assert not web.exists()
-    assert "web" in result["moved"]
+    assert "Local Storage" in result["moved"]
+    assert (web / "Cache" / "big.bin").exists()
+    assert "Cache" not in result["moved"]
 
 
 def test_find_codex_processes_ignores_self(monkeypatch):

@@ -124,13 +124,20 @@ def choose_provider(allow_custom: bool) -> Provider | None:
     head("选择 provider")
     preset = presets.deepseek_preset()
     wolfox = presets.wolfox_preset()
-    installed = [p for p in service.installed_providers() if p.get("id") != "deepseek"]
+    # Previously every installed provider except "deepseek" was listed, which
+    # meant an installed DeepSeek channel could not be re-selected at all
+    # (so its key could never be rotated). List everything; when an entry
+    # duplicates a preset the preset label is annotated instead.
+    installed = [p for p in service.installed_providers() if p.get("id")]
+    installed_ids = {p.get("id") for p in installed}
     default_model = preset.models[0] if preset.models else "(无)"
-    print(f"   1) {preset.name}  ({preset.base_url}, 默认模型 {default_model})")
-    print(f"   2) {wolfox.name}  ({wolfox.base_url}, 默认模型 {wolfox.models[0] if wolfox.models else '(无)'})")
+    tag1 = "（已接入）" if preset.id in installed_ids else ""
+    tag2 = "（已接入）" if wolfox.id in installed_ids else ""
+    print(f"   1) {preset.name}{tag1}  ({preset.base_url}, 默认模型 {default_model})")
+    print(f"   2) {wolfox.name}{tag2}  ({wolfox.base_url}, 默认模型 {wolfox.models[0] if wolfox.models else '(无)'})")
     base = 2
     if installed:
-        dim("   ── 已接入的 provider（可重新接入/切换/回退） ──")
+        dim("   ── 已接入的 provider（可更新 Key / 管理模型 / 回退 / 删除） ──")
         for j, rec in enumerate(installed):
             mdl = f", 模型: {' / '.join(rec.get('models') or [])}" if rec.get("models") else ""
             shown = rec.get("name") or rec.get("id") or ""
@@ -292,7 +299,10 @@ def custom_provider_wizard() -> Provider | None:
     if not levels:
         levels = ["none"]
     def_effort = "high" if "high" in levels else ("low" if "low" in levels else "none")
-    read_required("默认推理强度", def_effort)
+    effort_raw = read_required("默认推理强度", def_effort).strip()
+    effort = effort_raw or def_effort
+    if effort not in levels:
+        warn(f'"{effort}" 不在你填写的思考档位里，仍会写入 model_reasoning_effort。')
 
     vision = confirm("支持图片输入?", default=heuristics.likely_vision(models))
     full_instr = confirm("使用 Codex 完整 agent 提示词?", default=True)
@@ -321,6 +331,7 @@ def custom_provider_wizard() -> Provider | None:
         support_verbosity=False,
         parallel_tool_calls=False,
         disable_web_search=not search,
+        reasoning_effort=effort,
     )
 
 
@@ -329,21 +340,25 @@ def manage_models(record: dict) -> None:
     current = [m for m in (record.get("models") or []) if m]
 
     key = service.get_api_key(prov, interactive_prompt=lambda: prompt_api_key(prov))
-    if not key:
-        warn("未取得 API Key，无法拉取上游候选，已取消。")
-        return
-    fetch = upstream.fetch_models(prov.base_url, key)
-    if not fetch["ok"]:
-        warn(f"拉取上游模型列表失败（{fetch['error']}），已取消。")
-        return
-    up_models = list(fetch["models"])
-    kept = [s for s in current if s in up_models]
-    added = [s for s in up_models if s not in current]
-    stale = [s for s in current if s not in up_models]
+    fetch = {"ok": False, "models": [], "error": "未取得 API Key", "raw": None}
+    if key:
+        fetch = upstream.fetch_models(prov.base_url, key)
+    up_models: list[str] = list(fetch["models"]) if fetch["ok"] else []
+
+    # A transient upstream failure must not lock the user out of the purely
+    # local operations (remove / edit params), which need no network at all.
+    offline = not fetch["ok"]
+    kept = [s for s in current if s in up_models] if not offline else list(current)
+    added = [s for s in up_models if s not in current] if not offline else []
+    stale = [s for s in current if s not in up_models] if not offline else []
 
     title = prov.name if prov.name else prov.id
     head(f"模型列表管理：{title}（{prov.base_url}）")
-    if up_models:
+    if offline:
+        warn(f"无法获取上游模型列表（{fetch['error']}）。")
+        dim("  已进入本地模式：仍可「移除模型」「编辑模型参数」，")
+        dim("  但「勾选上游候选」「探测可用性」需要联网，暂不可用。")
+    elif up_models:
         dim(f"上游 /models 共返回 {len(up_models)} 个候选")
     else:
         warn("上游返回空列表（网关可能限制该 Key 可见模型）。")
@@ -361,11 +376,11 @@ def manage_models(record: dict) -> None:
         print("  ── 待处理变更 ────────────────────────────")
         print(f"     待接入: {' / '.join(pending_add) if pending_add else '(无)'}")
         print(f"     待移除: {' / '.join(pending_del) if pending_del else '(无)'}")
-        print("    1) 从上游候选勾选要接入的模型")
+        print("    1) 从上游候选勾选要接入的模型" + ("（离线不可用）" if offline else ""))
         print("    2) 手动输入要接入的模型名")
         print("    3) 移除已接入的模型")
         print("    4) 编辑模型参数（上下文窗口/有效百分比/自动压缩阈值）")
-        print("    5) 探测并移除当前 Key 不可用的模型")
+        print("    5) 探测并移除当前 Key 不可用的模型" + ("（离线不可用）" if offline else ""))
         print("    6) 清空所有待处理变更")
         print("    7) 应用变更并写盘")
         print("    8) 返回（不写盘）")
@@ -381,6 +396,9 @@ def manage_models(record: dict) -> None:
             continue
 
         if opt == "1":
+            if offline:
+                warn("离线模式：无法列出上游候选。请先用 2) 手动输入模型名。")
+                continue
             cand = [s for s in added if s not in pending_add]
             if not cand:
                 warn("没有可勾选的新候选（上游新模型均已接入或已列入待接入）。")
@@ -513,11 +531,16 @@ def manage_models(record: dict) -> None:
             continue
 
         if opt == "5":
+            if offline:
+                warn("离线模式：探测需要联网，已跳过。")
+                continue
             if not current:
                 warn("该 provider 还没有模型。")
                 continue
-            print(f"  开始探测 {len(current)} 个模型（每个最多 20 秒）...")
-            usable, unusable, unknown = upstream.probe_models(current, prov.base_url, key)
+            print(f"  开始探测 {len(current)} 个模型（每个最多 20 秒，端点按 wire_api={prov.wire_api}）...")
+            usable, unusable, unknown = upstream.probe_models(
+                current, prov.base_url, key, wire_api=prov.wire_api
+            )
             print("")
             print(f"  可用   : {' / '.join(usable) if usable else '(无)'}")
             if unusable:
@@ -717,6 +740,142 @@ def run_doctor() -> None:
     ok("请现在完全退出 Codex（含托盘），再重新打开，并新建一个对话查看模型列表。")
 
 
+def _refresh_models_for_key(prov: Provider, key: str) -> None:
+    """Re-sync the catalog against upstream after a credential change.
+
+    Rotating a key can change which models the account may actually use, so the
+    previously registered list is reconciled instead of being left stale (which
+    is what made unusable models linger in Codex's model picker).
+    """
+    fetch = upstream.fetch_models(prov.base_url, key)
+    if not fetch["ok"]:
+        warn(f"无法拉取上游模型列表（{fetch['error']}），模型清单本次不更新。")
+        warn("稍后可用主菜单 2) 管理模型列表 重新同步。")
+        return
+    up = list(fetch["models"])
+    if not up:
+        warn("上游返回空列表，为避免误删已保留原清单。")
+        return
+
+    current = [s for s in (prov.models or []) if s]
+    missing = [s for s in current if s not in up]
+    added = [s for s in up if s not in current]
+
+    if not missing and not added:
+        ok(f"模型清单与新 Key 一致（{len(current)} 个），无需调整。")
+        return
+
+    print("")
+    ok(f"上游可见 {len(up)} 个模型")
+    if added:
+        ok(f"新增可用: {' / '.join(added)}")
+    if missing:
+        warn(f"新 Key 已不可见: {' / '.join(missing)}")
+    if not missing:
+        if confirm(f"把 {len(added)} 个新增模型并入清单?", default=True):
+            try:
+                service.update_provider_models(prov, current, current + added)
+            except ValueError as exc:
+                err(str(exc))
+        return
+    print("")
+    print("  这些模型在新 Key 下已不可见，继续留在 Codex 里会出现在模型列表中却无法使用：")
+    dim("    " + " / ".join(missing))
+    if confirm(f"现在从清单中移除这 {len(missing)} 个不可用模型?", default=True):
+        final = [s for s in current if s not in missing]
+        if confirm(f"是否同时并入 {len(added)} 个新增模型?", default=True) and added:
+            final = final + [s for s in added if s not in final]
+        try:
+            service.update_provider_models(prov, current, final)
+            ok("模型清单已更新。")
+        except ValueError as exc:
+            err(str(exc))
+    else:
+        dim("已保留原清单（可稍后用主菜单 2) 手动清理）。")
+
+
+def _do_update_key(prov: Provider) -> None:
+    stored = service.stored_api_key(prov.id)
+    print("")
+    if stored:
+        dim(f"当前 Key: {stored[:6]}…{stored[-4:]}（共 {len(stored)} 位）" if len(stored) > 12 else "当前 Key: (已设置)")
+    else:
+        dim("当前未在 config.toml 中保存 Key。")
+    dim("直接回车可取消，原 Key 不会被改动。")
+    new_key = prompt_api_key(prov)
+    if not new_key:
+        dim("已取消，Key 未改动。")
+        return
+    if new_key == stored:
+        dim("新 Key 与当前 Key 相同，未做改动。")
+        return
+
+    print("")
+    dim("正在用新 Key 验证连通性...")
+    fetch = upstream.fetch_models(prov.base_url, new_key)
+    if not fetch["ok"]:
+        warn(f"新 Key 探活失败：{fetch['error']}")
+        if not confirm("仍然写入这个 Key?", default=False):
+            dim("已取消，原 Key 未改动。")
+            return
+    else:
+        ok(f"新 Key 有效，可见 {len(fetch['models'])} 个模型。")
+
+    try:
+        service.update_api_key(prov, new_key)
+    except ValueError as exc:
+        err(str(exc))
+        return
+    if fetch["ok"]:
+        _refresh_models_for_key(prov, new_key)
+
+
+def manage_existing_channel(prov: Provider, rec: dict) -> bool:
+    """Menu for an already-installed channel. Returns True to fall through to a
+    fresh install, False when the action was fully handled here."""
+    title = rec.get("name") or prov.id
+    while True:
+        head(f"该渠道已接入：{title}（{rec.get('base_url') or prov.base_url}）")
+        stored = service.stored_api_key(prov.id)
+        if stored:
+            masked = f"{stored[:6]}…{stored[-4:]}" if len(stored) > 12 else "(已设置)"
+            dim(f"  当前 Key: {masked}")
+        else:
+            dim("  当前 Key: 未保存在 config.toml（可能来自环境变量）")
+        print("    1) 更新 API Key（换 Key 后自动重新同步模型）")
+        print("    2) 重新接入 / 更新模型清单（保留现有 Key）")
+        print("    3) 管理模型列表")
+        print("    4) 删除此渠道（只删这一个，不影响其它渠道）")
+        print("    5) 回退到运行脚本前的整体快照")
+        print("    6) 返回")
+        opt = _read("  请输入 [1-6] ").strip()
+
+        if opt == "6":
+            return False
+        if opt == "1":
+            _do_update_key(prov)
+            continue
+        if opt == "2":
+            return True
+        if opt == "3":
+            manage_models(rec)
+            continue
+        if opt == "4":
+            print("")
+            try:
+                service.remove_channel(prov.id, confirm=lambda: confirm("确认删除这个渠道?", default=False))
+            except ValueError as exc:
+                err(str(exc))
+            return False
+        if opt == "5":
+            others = service.restore_impact(prov.id)
+            if others:
+                warn(f"整体回退会一并影响：{' / '.join(others)}")
+            service.restore_provider(prov, confirm=lambda: confirm("确认回退?", default=False))
+            return False
+        warn("输入无效，请重新选择。")
+
+
 def main_menu() -> None:
     global _active
     print("")
@@ -756,6 +915,15 @@ def main_menu() -> None:
             if prov is None:
                 continue
             _active = prov
+            already = next(
+                (r for r in service.installed_providers() if r.get("id") == prov.id),
+                None,
+            )
+            if already is not None and not manage_existing_channel(prov, already):
+                # The user picked an existing channel and then backed out (or
+                # finished an action) - never fall through to a fresh install,
+                # which used to silently re-add the channel with the old key.
+                continue
             key = service.get_api_key(prov, interactive_prompt=lambda: prompt_api_key(prov))
             if not key:
                 continue
@@ -769,13 +937,8 @@ def main_menu() -> None:
             reg = registry.load(paths.registry_path())
             reg_providers = reg.get("providers") if reg and isinstance(reg.get("providers"), list) else []
             entry = next((rp for rp in reg_providers if isinstance(rp, dict) and rp.get("id") == prov.id), None)
-            if entry is not None:
-                if entry.get("meta_overrides"):
-                    prov.meta_overrides = dict(entry["meta_overrides"])
-                if confirm("该 provider 之前接入过。先从上游拉取候选模型并合并新增?"):
-                    merged = service.sync_from_upstream(prov, key)
-                    if merged:
-                        prov.models = list(merged)
+            if entry is not None and entry.get("meta_overrides"):
+                prov.meta_overrides = dict(entry["meta_overrides"])
             service.install_provider(prov, key)
             _post_install_hint(prov)
             continue

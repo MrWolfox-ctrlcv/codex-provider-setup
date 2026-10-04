@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+
+from codex_provider.io_utils import toml_quote
 
 TARGET_KEYS = (
     "model",
@@ -126,17 +129,17 @@ def _format_val(v: str) -> str:
 
 def _target_value(key: str, model_slug: str, provider_id: str, reasoning_effort: str, catalog_value: str) -> str:
     if key == "model":
-        return f'"{model_slug}"'
+        return toml_quote(model_slug)
     if key == "model_provider":
-        return f'"{provider_id}"'
+        return toml_quote(provider_id)
     if key == "preferred_auth_method":
         return '"apikey"'
     if key == "forced_login_method":
         return '"api"'
     if key == "model_reasoning_effort":
-        return f'"{reasoning_effort}"'
+        return toml_quote(reasoning_effort)
     if key == "model_catalog_json":
-        return f'"{catalog_value}"'
+        return toml_quote(catalog_value)
     if key == "web_search":
         return '"disabled"'
     return '""'
@@ -293,18 +296,19 @@ def edit_config(
 
     final.append("")
     final.append(f"[model_providers.{provider_id}]")
-    final.append(f'name = "{provider_id}"')
-    final.append(f'base_url = "{base_url}"')
-    final.append(f'wire_api = "{wire_api}"')
+    final.append(f"name = {toml_quote(provider_id)}")
+    final.append(f"base_url = {toml_quote(base_url)}")
+    final.append(f"wire_api = {toml_quote(wire_api)}")
     if use_env_key:
-        final.append(f'env_key = "{env_var_name}"')
+        final.append(f"env_key = {toml_quote(env_var_name)}")
     else:
-        final.append(f'experimental_bearer_token = "{api_key_value}"')
+        final.append(f"experimental_bearer_token = {toml_quote(api_key_value)}")
 
     return EditResult(text="\n".join(final) + "\n", report=report, lines=final)
 
 
 def switch_model(source: str, slug: str) -> str:
+    quoted = toml_quote(slug)
     raw = source.replace("\r\n", "\n").rstrip("\n")
     lines = raw.split("\n") if raw else []
 
@@ -328,7 +332,7 @@ def switch_model(source: str, slug: str) -> str:
         trimmed = line.strip()
         if trimmed.startswith("["):
             if not replaced:
-                out.append(f'model = "{slug}"')
+                out.append(f"model = {quoted}")
                 out.append("")
                 replaced = True
             in_leading = False
@@ -342,7 +346,7 @@ def switch_model(source: str, slug: str) -> str:
             while (st.mlstate or st.depth != 0) and i < len(lines):
                 st.scan(lines[i])
                 i += 1
-            out.append(f'model = "{slug}"')
+            out.append(f"model = {quoted}")
             replaced = True
             continue
         st.scan(line)
@@ -350,6 +354,126 @@ def switch_model(source: str, slug: str) -> str:
         i += 1
 
     if not replaced:
-        out.append(f'model = "{slug}"')
+        out.append(f"model = {quoted}")
+
+    return "\n".join(out) + "\n"
+
+
+def remove_provider_section(source: str, provider_id: str) -> tuple[str, bool]:
+    """Delete ``[model_providers.<id>]`` (and any ``<id>.*`` sub-tables).
+
+    Used when removing a single channel: unlike a full ``restore`` this leaves
+    every other provider section, the user's MCP/projects/skills config and any
+    hand-edits made after install completely untouched.
+    """
+    prov_hdr = f"model_providers.{provider_id}"
+    raw = source.replace("\r\n", "\n").rstrip("\n")
+    lines = raw.split("\n") if raw else []
+
+    st = _ScanState()
+    out: list[str] = []
+    removed = False
+    skip = False
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        trimmed = line.strip()
+        if (not st.mlstate) and st.depth == 0 and trimmed.startswith("["):
+            close = trimmed.find("]")
+            hdr = trimmed[: close + 1] if close > 0 else trimmed
+            hdr = hdr.strip("[").strip("]").strip().replace('"', "").replace("'", "")
+            skip = hdr == prov_hdr or hdr.startswith(prov_hdr + ".")
+            if skip:
+                removed = True
+        if skip:
+            st.scan(line)
+            idx += 1
+            continue
+        out.append(line)
+        st.scan(line)
+        idx += 1
+
+    # Collapse a trailing run of blank lines left behind by the excision.
+    while out and not out[-1].strip():
+        out.pop()
+    text = "\n".join(out)
+    return (text + "\n" if text else ""), removed
+
+
+def provider_section_body(source: str, provider_id: str) -> str:
+    """Return the text of ``[model_providers.<id>]`` for inspection/validation."""
+    pattern = re.compile(
+        rf"(?m)^\[\s*model_providers\.{re.escape(provider_id)}\s*\](?P<body>.*?)(?=^\[\s*|\Z)",
+        re.S,
+    )
+    m = pattern.search(source.replace("\r\n", "\n"))
+    return m.group("body") if m else ""
+
+
+def _section_header_of(line: str) -> str:
+    """Section name for a table header line, or "" if it is not a header."""
+    trimmed = line.strip()
+    if not trimmed.startswith("["):
+        return ""
+    close = trimmed.find("]")
+    hdr = trimmed[: close + 1] if close > 0 else trimmed
+    return hdr.strip("[").strip("]").strip().replace('"', "").replace("'", "")
+
+
+def set_bearer_token(source: str, provider_id: str, new_key: str) -> str:
+    """Rewrite only ``experimental_bearer_token`` inside one provider section.
+
+    This is the key-rotation primitive: it substitutes the single credential
+    line and leaves every other byte of the user's config untouched.  If the
+    section exists but has no bearer line (it used ``env_key``), one is appended
+    at the end of that section.
+    """
+    quoted = f"experimental_bearer_token = {toml_quote(new_key)}"
+    raw = source.replace("\r\n", "\n").rstrip("\n")
+    lines = raw.split("\n") if raw else []
+
+    prov_hdr = f"model_providers.{provider_id}"
+    st = _ScanState()
+    out: list[str] = []
+    in_target = False
+    seen_target = False
+    replaced = False
+    # Index in `out` just before which to insert when the section has no bearer.
+    section_end: int | None = None
+
+    for line in lines:
+        is_header = (not st.mlstate) and st.depth == 0 and _section_header_of(line) != ""
+        if is_header:
+            if in_target and not replaced:
+                # Leaving the target section without having found a bearer line.
+                section_end = len(out)
+            hdr = _section_header_of(line)
+            in_target = hdr == prov_hdr
+            seen_target = seen_target or in_target
+            out.append(line)
+            st.scan(line)
+            continue
+
+        if in_target and not st.mlstate and st.depth == 0 and _key_of(line) == "experimental_bearer_token":
+            out.append(quoted)
+            replaced = True
+            st.scan(line)
+            continue
+
+        out.append(line)
+        st.scan(line)
+
+    if not replaced:
+        if not seen_target:
+            # No such provider section: leave the document exactly as it was.
+            return source.replace("\r\n", "\n").rstrip("\n") + "\n"
+        if in_target:
+            # Target section was the last one in the file.
+            section_end = len(out)
+        at = len(out) if section_end is None else section_end
+        # Trim trailing blank lines so the new key lands inside the section.
+        while at > 0 and not out[at - 1].strip():
+            at -= 1
+        out[at:at] = ["", quoted] if at < len(out) else ["", quoted]
 
     return "\n".join(out) + "\n"

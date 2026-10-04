@@ -4,6 +4,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 from codex_provider.env_os import (
     _rc_candidates,
     _remove_export,
@@ -136,40 +138,70 @@ def test_persist_env_linux_writes_each_rc_file(tmp_path):
     write_text(rc1_exists, "keep=1\n")
     persist_env("MIMO_API_KEY", "sk-x", platform="linux", rc_files=[rc1, rc2])
     assert read_text(rc1) == 'keep=1\nexport MIMO_API_KEY="sk-x"\n'
-    assert read_text(rc2) == 'export MIMO_API_KEY="sk-x"\n'
+    # A candidate rc file that does not exist is no longer created: the secret
+    # must not be injected into shells the user never configured.
+    assert not rc2.exists()
 
 
 def test_persist_env_linux_idempotent(tmp_path):
     rc1 = tmp_path / "one"
-    rc2 = tmp_path / "two"
+    rc1.write_text("x=1\n", encoding="utf-8")
     for _ in range(2):
-        persist_env("K", "v", platform="linux", rc_files=[rc1, rc2])
-    for p in (rc1, rc2):
-        t = read_text(p)
-        assert t.count("export K=") == 1
-        assert t == 'export K="v"\n'
+        persist_env("K", "v", platform="linux", rc_files=[rc1])
+    t = read_text(rc1)
+    assert t.count("export K=") == 1
+    assert t == 'x=1\nexport K="v"\n'
 
 
 def test_persist_env_darwin_uses_rc_files(tmp_path):
     rc = tmp_path / ".zshrc"
+    rc.write_text("# zsh\n", encoding="utf-8")
     persist_env("K", "sk-darwin", platform="darwin", rc_files=[rc])
-    assert read_text(rc) == 'export K="sk-darwin"\n'
+    assert read_text(rc) == '# zsh\nexport K="sk-darwin"\n'
 
 
 def test_persist_env_default_rc_candidates(tmp_path, monkeypatch):
     monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+    # With no rc file present, exactly one default candidate is created.
     persist_env("K", "sk-default", platform="linux", home=tmp_path)
-    for p in _all_rc(tmp_path):
-        assert read_text(p) == 'export K="sk-default"\n'
+    written = [p for p in _all_rc(tmp_path) if p.exists()]
+    assert len(written) == 1
+    assert read_text(written[0]) == 'export K="sk-default"\n'
+
+
+def test_persist_env_backs_up_rc_before_rewrite(tmp_path):
+    rc = tmp_path / ".zshrc"
+    write_text(rc, "original=1\n")
+    persist_env("K", "v", platform="linux", rc_files=[rc])
+    bak = tmp_path / ".zshrc.codex-provider-setup.bak"
+    assert bak.exists()
+    assert read_text(bak) == "original=1\n"
+
+
+def test_persist_env_rejects_illegal_name(tmp_path):
+    rc = tmp_path / ".zshrc"
+    write_text(rc, "x=1\n")
+    with pytest.raises(ValueError):
+        persist_env("BAD NAME", "v", platform="linux", rc_files=[rc])
+
+
+def test_persist_env_escapes_newline(tmp_path):
+    rc = tmp_path / ".zshrc"
+    write_text(rc, "x=1\n")
+    persist_env("K", "line1\nline2", platform="linux", rc_files=[rc])
+    # A raw newline would split the export across lines and break every shell.
+    assert read_text(rc) == 'x=1\nexport K="line1\\nline2"\n'
 
 
 def test_remove_env_linux(tmp_path):
     rc1 = tmp_path / "one"
     rc2 = tmp_path / "two"
+    write_text(rc1, "a=1\n")
+    write_text(rc2, "b=2\n")
     persist_env("K", "v", platform="linux", rc_files=[rc1, rc2])
     remove_env("K", platform="linux", rc_files=[rc1, rc2])
-    assert read_text(rc1) == ""
-    assert read_text(rc2) == ""
+    assert read_text(rc1) == "a=1\n"
+    assert read_text(rc2) == "b=2\n"
 
 
 def test_remove_env_linux_keeps_unrelated(tmp_path):
@@ -187,9 +219,9 @@ def test_remove_env_missing_rc_files(tmp_path):
 def test_remove_env_default_rc_candidates(tmp_path, monkeypatch):
     monkeypatch.setenv("SHELL", "/bin/bash")
     rc = tmp_path / ".bashrc"
-    write_text(rc, 'export K="v"\n')
+    write_text(rc, 'export K="v"\nkeep=1\n')
     remove_env("K", platform="linux", home=tmp_path)
-    assert read_text(rc) == ""
+    assert read_text(rc) == "keep=1\n"
 
 
 class _FakeWinRegKey:

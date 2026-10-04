@@ -276,22 +276,33 @@ def test_select_fetched_models_no_match_three_times(monkeypatch):
     assert interact.select_fetched_models(ids) is None
 
 
-def test_manage_models_no_key(monkeypatch, tmp_codex_home):
+def test_manage_models_no_key(monkeypatch, tmp_codex_home, capsys):
+    """Without a key we still enter local mode instead of refusing outright."""
     calls: list[str] = []
     monkeypatch.setattr(interact.service, "get_api_key", lambda *a, **k: calls.append("k") or None)
     monkeypatch.setattr(interact.upstream, "fetch_models", lambda *a, **k: pytest.fail("不应拉取"))
+    monkeypatch.setattr(interact, "_read", lambda prompt="": "8")
     interact.manage_models(make_rec())
+    out = capsys.readouterr().out
     assert calls == ["k"]
+    assert "本地模式" in out
 
 
-def test_manage_models_fetch_fail(monkeypatch, tmp_codex_home):
+def test_manage_models_fetch_fail_degrades_to_local_mode(monkeypatch, tmp_codex_home, capsys):
+    """A transient upstream failure must not lock out local-only operations."""
     monkeypatch.setattr(interact.service, "get_api_key", lambda *a, **k: "sk")
     monkeypatch.setattr(
         interact.upstream,
         "fetch_models",
         lambda *a, **k: {"ok": False, "models": [], "raw": None, "error": "boom"},
     )
+    monkeypatch.setattr(interact, "_read", lambda prompt="": "8")
     interact.manage_models(make_rec())
+    out = capsys.readouterr().out
+    assert "本地模式" in out
+    # The purely local options must still be offered.
+    assert "4) 编辑模型参数" in out
+    assert "离线不可用" in out
 
 
 def test_manage_models_add_and_apply(monkeypatch, tmp_codex_home):
@@ -380,7 +391,7 @@ def test_manage_models_probe_remove(monkeypatch, tmp_codex_home):
     monkeypatch.setattr(
         interact.upstream,
         "probe_models",
-        lambda models, base, key: (["m2"], ["m1"], []),
+        lambda models, base, key, **kw: (["m2"], ["m1"], []),
     )
     monkeypatch.setattr(interact.service, "current_state", lambda: ("(未设置)", "(未设置)"))
     applied: list[tuple[object, list[str], list[str]]] = []
@@ -522,25 +533,61 @@ def test_main_menu_install_flow(monkeypatch, tmp_codex_home):
     prov = Provider(id="deepseek", name="DeepSeek 官方", base_url="https://api.deepseek.com/", models=["ds-1"])
     monkeypatch.setattr(interact, "choose_provider", lambda allow_custom: prov)
     monkeypatch.setattr(interact.service, "get_api_key", lambda *a, **k: "sk-x")
+    monkeypatch.setattr(interact.service, "installed_providers", lambda: [])
     monkeypatch.setattr(
         interact.registry,
         "load",
         lambda _p: {"providers": [{"id": "deepseek", "meta_overrides": {"ds-1": {"context_window": 111}}}]},
     )
-    monkeypatch.setattr(interact.service, "sync_from_upstream", lambda *a, **k: ["merged-1", "merged-2"])
     installed: list[tuple[object, str]] = []
     monkeypatch.setattr(interact.service, "install_provider", lambda p, k: installed.append((p, k)))
     # keep the flow deterministic regardless of whether Codex runs on this machine
     monkeypatch.setattr(interact.doctor, "find_codex_processes", lambda: [])
     monkeypatch.setattr(interact.doctor, "ui_state_files", lambda: [])
-    answers = iter(["1", "y", "7"])
+    answers = iter(["1", "7"])
     monkeypatch.setattr(builtins, "input", lambda _p="": next(answers))
     interact.main_menu()
     assert len(installed) == 1
     prov, key = installed[0]
     assert key == "sk-x"
     assert prov.meta_overrides == {"ds-1": {"context_window": 111}}
-    assert prov.models == ["merged-1", "merged-2"]
+
+
+def test_main_menu_existing_channel_offers_key_update(monkeypatch, tmp_codex_home):
+    """Picking an already-installed channel must offer a key rotation instead of
+    silently reusing the stored (possibly revoked) credential."""
+    monkeypatch.setattr(interact, "_active", None)
+    monkeypatch.setattr(interact.service, "current_state", lambda: ("ds-1", "deepseek"))
+    prov = Provider(id="deepseek", name="DeepSeek", base_url="https://api.deepseek.com/", models=["ds-1"])
+    monkeypatch.setattr(interact, "choose_provider", lambda allow_custom: prov)
+    rec = {
+        "id": "deepseek", "name": "DeepSeek", "base_url": "https://api.deepseek.com/",
+        "models": ["ds-1"], "wire_api": "responses", "env_key": "",
+        "vision": False, "reasoning_levels": [], "truncation_mode": "tokens",
+        "apply_patch": False, "search": False, "disable_web_search": False,
+        "meta_overrides": {},
+    }
+    monkeypatch.setattr(interact.service, "installed_providers", lambda: [rec])
+    monkeypatch.setattr(interact.service, "stored_api_key", lambda _pid: "sk-OLD-DEAD")
+    monkeypatch.setattr(interact.service, "provider_from_installed", lambda _r: prov)
+
+    rotated: list[tuple[object, str]] = []
+    monkeypatch.setattr(interact.service, "update_api_key", lambda p, k, **kw: rotated.append((p, k)))
+    monkeypatch.setattr(interact.upstream, "fetch_models", lambda *a, **k: {"ok": True, "models": ["ds-1"], "raw": {}})
+    monkeypatch.setattr(interact, "prompt_api_key", lambda _p: "sk-NEW-GOOD")
+    monkeypatch.setattr(interact.service, "sync_from_upstream", lambda *a, **k: None)
+
+    installed: list[object] = []
+    monkeypatch.setattr(interact.service, "install_provider", lambda p, k: installed.append(p))
+
+    # menu 1 -> existing channel -> option 1 (update key) -> back -> quit
+    answers = iter(["1", "1", "6", "7"])
+    monkeypatch.setattr(builtins, "input", lambda _p="": next(answers))
+    interact.main_menu()
+
+    assert rotated and rotated[0][1] == "sk-NEW-GOOD"
+    # The critical regression: no fresh install with the stale key.
+    assert installed == []
 
 
 def test_main_menu_install_warns_when_codex_running(monkeypatch, tmp_codex_home, capsys):

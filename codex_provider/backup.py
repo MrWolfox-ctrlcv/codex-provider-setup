@@ -31,6 +31,29 @@ def write_manifest(backup_dir: Path, fields: dict[str, str], report: list[str]) 
     write_text(backup_dir / "manifest.txt", "\n".join(lines) + "\n")
 
 
+def snapshot_files(
+    dest_dir: Path,
+    paths: list[Path],
+    *,
+    stamp: str,
+) -> Path:
+    """Copy the given files into ``dest_dir`` as a timestamped safety net.
+
+    Destructive single-channel operations (key rotation, channel removal) do
+    not restore an old full-config snapshot, so they take their own recoverable
+    copy first.  Files that do not exist are recorded as absent via a marker
+    line so the snapshot is unambiguous.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for path in paths:
+        if path.exists():
+            shutil.copy2(path, dest_dir / path.name)
+        else:
+            write_text(dest_dir / f"{path.name}.absent", "")
+    write_text(dest_dir / "snapshot.txt", f"taken_at={stamp}\n")
+    return dest_dir
+
+
 def restore(
     backup_dir: Path,
     config_path: Path,
