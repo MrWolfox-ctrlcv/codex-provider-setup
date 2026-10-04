@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from codex_provider import backup, catalog, env_os, paths, registry, toml_edit, upstream
+from codex_provider import __version__ as SCRIPT_VERSION
 from codex_provider.io_utils import (
     atomic_write,
     is_legal_model_slug,
@@ -17,8 +18,6 @@ from codex_provider.io_utils import (
     sanitize_ctrl,
 )
 from codex_provider.provider import Provider
-
-SCRIPT_VERSION = "1.1.0"
 
 Echo = Callable[[str], None]
 

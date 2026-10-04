@@ -4,7 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codex-provider-setup"
-version = "0.1.0"
+# Single source of truth: codex_provider/__init__.py.  Keeping a second literal
+# here let the package version and the in-app SCRIPT_VERSION drift apart.
+dynamic = ["version"]
 description = "Cross-platform one-shot setup/manager for arbitrary Codex model providers"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,6 +22,9 @@ codex-provider-setup = "codex_provider.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["codex_provider"]
+
+[tool.hatch.version]
+path = "codex_provider/__init__.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

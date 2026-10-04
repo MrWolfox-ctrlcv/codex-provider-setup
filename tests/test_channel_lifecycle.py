@@ -455,3 +455,28 @@ def test_edit_config_escapes_hostile_values():
     parsed = tomllib.loads(cfg.text)
     assert parsed["model_providers"]["p1"]["base_url"] == 'https://a/v1"x'
     assert parsed["model_providers"]["p1"]["experimental_bearer_token"] == 'sk-a"b\nc'
+
+
+# --------------------------------------------------------------------------
+# Version must be single-sourced (it previously drifted: 0.1.0 vs 1.1.0)
+# --------------------------------------------------------------------------
+
+
+def test_version_is_single_sourced():
+    from codex_provider import __version__
+    from codex_provider.service import SCRIPT_VERSION
+
+    assert SCRIPT_VERSION == __version__
+
+
+def test_pyproject_does_not_hardcode_a_second_version():
+    """pyproject must take the version dynamically from the package."""
+    import tomllib as _tomllib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    data = _tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    project = data["project"]
+    assert "version" not in project, "pyproject hardcodes a version again"
+    assert "version" in project.get("dynamic", [])
+    assert data["tool"]["hatch"]["version"]["path"] == "codex_provider/__init__.py"
